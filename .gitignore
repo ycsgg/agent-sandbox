@@ -1,0 +1,5 @@
+/target/
+/microsandbox/
+/.agent-sandbox/
+*.log
+.DS_Store

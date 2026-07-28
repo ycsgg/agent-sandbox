@@ -1,0 +1,4 @@
+# The built-in fast path. Version suffixes are added by the resolver.
+go: golang
+rust: rust
+node: node

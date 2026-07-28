@@ -1,0 +1,15 @@
+[package]
+name = "agent-sandbox-runtime-msb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "lib/lib.rs"
+
+[dependencies]
+agent-sandbox-runtime.workspace = true
+async-trait.workspace = true
+microsandbox.workspace = true
+tokio.workspace = true

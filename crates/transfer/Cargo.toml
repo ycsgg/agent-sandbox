@@ -1,0 +1,16 @@
+[package]
+name = "agent-sandbox-transfer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "lib/lib.rs"
+
+[dependencies]
+ignore.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

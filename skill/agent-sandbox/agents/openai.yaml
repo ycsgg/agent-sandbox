@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Sandbox"
+  short_description: "Run untrusted project code in disposable local microVMs"
+  default_prompt: "Use $agent-sandbox to build, test, or inspect this project inside a disposable microVM."

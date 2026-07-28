@@ -1,0 +1,8 @@
+manifest_version: 1
+toolchains:
+  go:
+    install: "download-official-archive"
+  rust:
+    install: "rustup"
+  node:
+    install: "nodesource"

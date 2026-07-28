@@ -1,0 +1,15 @@
+[package]
+name = "agent-sandbox-environment"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "lib/lib.rs"
+
+[dependencies]
+agent-sandbox-detector.workspace = true
+agent-sandbox-runtime.workspace = true
+serde.workspace = true
+thiserror.workspace = true

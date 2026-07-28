@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cache",
+    "crates/cli",
+    "crates/core",
+    "crates/detector",
+    "crates/environment",
+    "crates/exec",
+    "crates/policy",
+    "crates/runtime",
+    "crates/runtime-msb",
+    "crates/state",
+    "crates/transfer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.94"
+
+[workspace.dependencies]
+agent-sandbox-cache = { path = "crates/cache" }
+agent-sandbox-core = { path = "crates/core" }
+agent-sandbox-detector = { path = "crates/detector" }
+agent-sandbox-environment = { path = "crates/environment" }
+agent-sandbox-exec = { path = "crates/exec" }
+agent-sandbox-policy = { path = "crates/policy" }
+agent-sandbox-runtime = { path = "crates/runtime" }
+agent-sandbox-runtime-msb = { path = "crates/runtime-msb" }
+agent-sandbox-state = { path = "crates/state" }
+agent-sandbox-transfer = { path = "crates/transfer" }
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1.10"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+dirs = "6"
+futures = "0.3"
+hex = "0.4"
+ignore = "0.4"
+microsandbox = { version = "=0.6.7", default-features = false, features = ["net", "prebuilt"] }
+rusqlite = { version = "=0.32.1", features = ["bundled", "chrono"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.20"
+thiserror = "2.0"
+tokio = { version = "1.47", features = ["full"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = "1.2"
+which = "8"

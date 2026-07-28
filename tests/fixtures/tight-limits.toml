@@ -1,0 +1,21 @@
+[runtime]
+default_ttl = "5m"
+max_ttl = "30m"
+
+[resources]
+default_cpus = 1
+default_memory = "512M"
+default_disk = "1G"
+max_cpus = 2
+max_memory = "2G"
+max_disk = "4G"
+
+[output]
+memory_tail = "4K"
+max_log_disk = "8M"
+max_artifact_total = "16M"
+
+[transfer]
+max_files = 1000
+max_file_size = "8M"
+max_total_size = "32M"

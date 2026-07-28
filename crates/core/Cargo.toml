@@ -1,0 +1,28 @@
+[package]
+name = "agent-sandbox-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+path = "lib/lib.rs"
+
+[dependencies]
+agent-sandbox-detector.workspace = true
+agent-sandbox-environment.workspace = true
+agent-sandbox-policy.workspace = true
+agent-sandbox-runtime.workspace = true
+agent-sandbox-state.workspace = true
+agent-sandbox-transfer.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
