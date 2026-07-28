@@ -4,7 +4,9 @@
 
 use std::{
     collections::BTreeMap,
+    fmt,
     path::{Path, PathBuf},
+    str::FromStr,
     time::Duration,
 };
 
@@ -13,6 +15,10 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+
+mod registry;
+
+pub use registry::RuntimeRegistry;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -40,6 +46,132 @@ pub enum RuntimeError {
     /// The requested feature is not implemented by the backend.
     #[error("runtime feature is unsupported: {0}")]
     Unsupported(String),
+
+    /// Runtime selection or configuration is invalid.
+    #[error("invalid runtime configuration: {0}")]
+    Configuration(String),
+}
+
+/// Stable runtime backend identifier.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct BackendId(String);
+
+impl BackendId {
+    /// Microsandbox backend identifier.
+    pub const MICROSANDBOX: &'static str = "microsandbox";
+    /// QEMU backend identifier.
+    pub const QEMU: &'static str = "qemu";
+
+    /// Parse and validate a backend identifier.
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 32
+            || value.chars().any(|character| {
+                !(character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-')
+            })
+        {
+            return Err(RuntimeError::Configuration(format!(
+                "backend identifier {value:?} must contain 1-32 lowercase ASCII letters, digits, or hyphens"
+            )));
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrow the canonical identifier.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Construct the Microsandbox identifier.
+    pub fn microsandbox() -> Self {
+        Self(Self::MICROSANDBOX.into())
+    }
+
+    /// Construct the QEMU identifier.
+    pub fn qemu() -> Self {
+        Self(Self::QEMU.into())
+    }
+}
+
+impl Default for BackendId {
+    fn default() -> Self {
+        Self::microsandbox()
+    }
+}
+
+impl fmt::Display for BackendId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for BackendId {
+    type Err = RuntimeError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
+/// A boot-source family accepted by a runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BootSourceKind {
+    /// OCI image reference.
+    OciImage,
+    /// Backend snapshot.
+    Snapshot,
+    /// Bootable machine disk.
+    DiskImage,
+    /// Direct kernel boot, optionally with a disk and initrd.
+    DirectKernel,
+}
+
+/// Independently discoverable runtime operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeFeature {
+    /// Stream non-interactive guest commands.
+    Exec,
+    /// Attach an interactive terminal.
+    Attach,
+    /// Transfer guest files.
+    FileTransfer,
+    /// Mount a host workspace read-only.
+    ReadOnlyMount,
+    /// Mount a host workspace read-write.
+    ReadWriteMount,
+    /// Publish guest TCP ports on host loopback.
+    PortForward,
+    /// Enforce custom egress rules.
+    NetworkRules,
+    /// Create and manage backend snapshots.
+    Snapshots,
+    /// Manage cached OCI images.
+    ImageCache,
+    /// Expose a serial log.
+    SerialLog,
+    /// Expose a QMP-compatible machine control channel.
+    MachineControl,
+    /// Expose a loopback-only GDB remote stub.
+    GdbStub,
+}
+
+/// Static feature declaration for one backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendCapabilities {
+    /// Backend identifier.
+    pub backend: BackendId,
+    /// Supported boot-source families.
+    pub boot_sources: Vec<BootSourceKind>,
+    /// Supported runtime operations.
+    pub features: Vec<RuntimeFeature>,
+    /// Supported guest architecture names.
+    pub architectures: Vec<String>,
+    /// Supported accelerator names.
+    pub accelerators: Vec<String>,
 }
 
 /// Network exposure selected for a sandbox.
@@ -106,6 +238,8 @@ pub struct NetworkRule {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProjectMode {
+    /// Do not expose a host project to the guest.
+    None,
     /// Copy validated project files to a private guest disk.
     Copy,
     /// Bind the project read-only at `/workspace`.
@@ -151,6 +285,65 @@ pub enum RootSource {
     Image(String),
     /// A Microsandbox snapshot name or path.
     Snapshot(String),
+    /// A bootable virtual-machine definition.
+    Machine(Box<MachineBootSpec>),
+}
+
+/// QEMU-compatible virtual disk image format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskImageFormat {
+    /// Raw block image.
+    Raw,
+    /// QEMU copy-on-write image version 2.
+    Qcow2,
+}
+
+/// One host disk image attached to a virtual machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskImageSpec {
+    /// Host image path.
+    pub path: PathBuf,
+    /// On-disk image format.
+    pub format: DiskImageFormat,
+    /// Prevent guest writes to the source image.
+    pub read_only: bool,
+}
+
+/// Generic system-machine boot inputs used by full-system backends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineBootSpec {
+    /// Guest architecture such as `x86_64`, `aarch64`, or `riscv64`.
+    pub architecture: String,
+    /// Optional machine type override.
+    pub machine: Option<String>,
+    /// Optional virtual CPU model override.
+    pub cpu: Option<String>,
+    /// Optional accelerator override (`auto`, `kvm`, `hvf`, `whpx`, or `tcg`).
+    pub accelerator: Option<String>,
+    /// Optional bootable root disk.
+    pub disk: Option<DiskImageSpec>,
+    /// Optional direct-boot kernel image.
+    pub kernel: Option<PathBuf>,
+    /// Optional direct-boot initramfs.
+    pub initrd: Option<PathBuf>,
+    /// Optional device-tree blob.
+    pub dtb: Option<PathBuf>,
+    /// Optional platform firmware image.
+    pub firmware: Option<PathBuf>,
+    /// Kernel command-line suffix.
+    pub kernel_append: Vec<String>,
+    /// Optional debugger endpoint and initial pause.
+    pub debug: Option<MachineDebugSpec>,
+}
+
+/// Generic full-system debugger settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineDebugSpec {
+    /// Requested loopback GDB port, or zero for automatic allocation.
+    pub gdb_port: u16,
+    /// Start CPUs paused until a debugger or machine-control client resumes them.
+    pub pause_at_boot: bool,
 }
 
 /// A loopback TCP port publication.
@@ -167,6 +360,8 @@ pub struct PortMapping {
 pub struct CreateSpec {
     /// Stable sandbox identifier.
     pub id: String,
+    /// Runtime backend selected after host-policy enforcement.
+    pub backend: BackendId,
     /// Root filesystem source.
     pub root: RootSource,
     /// Number of guest virtual CPUs.
@@ -189,7 +384,8 @@ pub struct CreateSpec {
     pub env: Vec<(String, String)>,
     /// Published loopback ports.
     pub ports: Vec<PortMapping>,
-    /// Runtime-enforced maximum lifetime.
+    /// Requested maximum lifetime. The wrapper lease always enforces this
+    /// during reconciliation; a backend may add its own independent backstop.
     pub max_duration: Duration,
     /// Whether backend state should disappear once the VM stops.
     pub ephemeral: bool,
@@ -268,10 +464,25 @@ pub type ExecStream = mpsc::Receiver<Result<ExecEvent>>;
 pub struct SandboxInfo {
     /// Sandbox identifier.
     pub id: String,
+    /// Owning runtime backend.
+    pub backend: BackendId,
     /// Runtime status.
     pub status: String,
     /// Creation time when known.
     pub created_at: Option<DateTime<Utc>>,
+    /// Backend-specific, reader-facing endpoints and diagnostics.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
+}
+
+impl SandboxInfo {
+    /// Whether backend state still owns live VM resources.
+    ///
+    /// Full-system backends may legitimately be paused or suspended, so
+    /// callers must not equate "active" with the literal status `running`.
+    pub fn is_active(&self) -> bool {
+        !matches!(self.status.as_str(), "created" | "stopped" | "crashed")
+    }
 }
 
 /// Runtime snapshot metadata used for managed environments and cache policy.
@@ -330,6 +541,12 @@ pub struct GuestEntry {
 /// Pluggable microVM runtime used by the core orchestration layer.
 #[async_trait]
 pub trait SandboxRuntime: Send + Sync {
+    /// Stable backend identifier.
+    fn backend_id(&self) -> BackendId;
+
+    /// Static backend capabilities.
+    fn capabilities(&self) -> BackendCapabilities;
+
     /// Create and start a sandbox.
     async fn create(&self, spec: &CreateSpec) -> Result<SandboxInfo>;
 

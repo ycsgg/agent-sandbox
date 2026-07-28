@@ -1,7 +1,9 @@
 # Agent Sandbox
 
-`asbx` runs project build, test, and audit commands inside disposable
-Microsandbox microVMs. Project code is copied into the guest by default,
+`asbx` runs isolated workloads through pluggable local VM backends.
+Microsandbox handles OCI-based project commands; QEMU handles bootable disks,
+direct kernel boot, multiple guest architectures, serial logs, QMP, and an
+optional loopback GDB stub. Project code is copied into the guest by default,
 host environment variables are not inherited, public networking excludes
 host/private/link-local ranges, and one-shot VMs are removed after execution.
 Guest output is streamed through bounded queues; retained JSON tails and
@@ -28,14 +30,17 @@ cargo build --release -p agent-sandbox-cli
 cargo install --path crates/cli
 ```
 
-Rust 1.94 or newer is required. Runtime support follows Microsandbox v0.6.7:
-Linux with KVM, Apple Silicon macOS with Hypervisor.framework, and Windows with
-Windows Hypervisor Platform.
+Rust 1.94 or newer is required. Microsandbox v0.6.7 uses KVM on Linux,
+Hypervisor.framework on Apple Silicon macOS, and Windows Hypervisor Platform
+on Windows. The QEMU backend selects KVM, HVF, or WHPX for same-architecture
+guests and falls back to TCG for cross-architecture guests. QEMU is optional
+unless that backend is selected.
 
 On Apple Silicon, use the Microsandbox setup checks before the first VM:
 
 ```bash
 cargo run -p agent-sandbox-cli -- doctor
+cargo run -p agent-sandbox-cli -- doctor --backend qemu
 ```
 
 ## Usage
@@ -56,7 +61,27 @@ asbx close "$id"
 
 asbx cache status --json
 asbx cache prune --max-size 20G --dry-run --json
+
+asbx backend list --json
+id="$(asbx open --backend qemu --root-disk ./guest.qcow2 \
+  --firmware ./QEMU_EFI.fd --project-mode none --network off)"
+asbx inspect "$id" --json
+asbx close "$id"
+
+# Direct kernel boot with an automatically allocated loopback GDB port.
+asbx open --backend qemu --kernel ./Image --initrd ./initramfs.cpio.gz \
+  --kernel-append 'console=ttyAMA0' --gdb --pause-at-boot \
+  --project-mode none --network off --output json
 ```
+
+QEMU machine mode defaults to no workspace and offline networking. A writable
+root disk uses QEMU temporary snapshot mode, so the caller-owned base image is
+not modified. Configure `qemu.ssh_user` (and usually `qemu.ssh_key`) to enable
+`copy`, `exec`, `shell`, and artifact transfer for guests that run SSH.
+Filtered `public`, `dependencies`, and `rules` networking remains a
+Microsandbox capability; QEMU currently accepts only `off` and host-gated
+`all`. QEMU lease expiry is enforced on the next `asbx` invocation; unlike
+Microsandbox, the QEMU adapter does not install an always-running TTL helper.
 
 See [`skill/agent-sandbox/SKILL.md`](skill/agent-sandbox/SKILL.md) and
 [`agent-sandbox.md`](agent-sandbox.md) for workflows and design rationale.

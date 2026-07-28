@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use agent_sandbox_runtime::BackendId;
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -76,6 +77,8 @@ pub enum StateError {
 pub struct SessionRecord {
     /// Sandbox identifier.
     pub id: String,
+    /// Owning runtime backend.
+    pub backend: BackendId,
     /// Canonical host project path.
     pub project: PathBuf,
     /// Resolved root source description.
@@ -165,6 +168,7 @@ impl StateStore {
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY NOT NULL,
+                backend TEXT NOT NULL DEFAULT 'microsandbox',
                 project TEXT NOT NULL,
                 root TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
@@ -200,6 +204,19 @@ impl StateStore {
                 ON environments(last_used_at);
             ",
         )?;
+        let session_columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(sessions)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !session_columns.iter().any(|column| column == "backend") {
+            connection.execute(
+                "ALTER TABLE sessions
+                 ADD COLUMN backend TEXT NOT NULL DEFAULT 'microsandbox'",
+                [],
+            )?;
+        }
         let has_active = {
             let mut statement = connection.prepare("PRAGMA table_info(reservations)")?;
             statement
@@ -402,10 +419,11 @@ impl StateStore {
     pub fn insert(&self, record: &SessionRecord) -> Result<()> {
         self.connection()?.execute(
             "INSERT INTO sessions (
-                id, project, root, created_at, expires_at, maximum_expires_at, ports_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                id, backend, project, root, created_at, expires_at, maximum_expires_at, ports_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 record.id,
+                record.backend.as_str(),
                 record.project.to_string_lossy(),
                 record.root,
                 record.created_at.timestamp(),
@@ -421,7 +439,7 @@ impl StateStore {
     pub fn get(&self, id: &str) -> Result<SessionRecord> {
         self.connection()?
             .query_row(
-                "SELECT id, project, root, created_at, expires_at, maximum_expires_at, ports_json
+                "SELECT id, backend, project, root, created_at, expires_at, maximum_expires_at, ports_json
                  FROM sessions WHERE id = ?1",
                 [id],
                 decode_record,
@@ -434,7 +452,7 @@ impl StateStore {
     pub fn list(&self) -> Result<Vec<SessionRecord>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, project, root, created_at, expires_at, maximum_expires_at, ports_json
+            "SELECT id, backend, project, root, created_at, expires_at, maximum_expires_at, ports_json
              FROM sessions ORDER BY created_at ASC",
         )?;
         let records = statement
@@ -447,7 +465,7 @@ impl StateStore {
     pub fn expired(&self, now: DateTime<Utc>) -> Result<Vec<SessionRecord>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, project, root, created_at, expires_at, maximum_expires_at, ports_json
+            "SELECT id, backend, project, root, created_at, expires_at, maximum_expires_at, ports_json
              FROM sessions WHERE expires_at <= ?1 ORDER BY expires_at ASC",
         )?;
         let records = statement
@@ -581,22 +599,27 @@ impl StateStore {
 //--------------------------------------------------------------------------------------------------
 
 fn decode_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
-    let created_at: i64 = row.get(3)?;
-    let expires_at: i64 = row.get(4)?;
-    let maximum_expires_at: i64 = row.get(5)?;
-    let ports_json: String = row.get(6)?;
+    let created_at: i64 = row.get(4)?;
+    let expires_at: i64 = row.get(5)?;
+    let maximum_expires_at: i64 = row.get(6)?;
+    let ports_json: String = row.get(7)?;
     let parse_time = |value| {
         Utc.timestamp_opt(value, 0)
             .single()
             .ok_or_else(|| rusqlite::Error::IntegralValueOutOfRange(0, value))
     };
     let ports = serde_json::from_str(&ports_json).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let backend_value: String = row.get(1)?;
+    let backend = BackendId::new(backend_value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(error))
     })?;
     Ok(SessionRecord {
         id: row.get(0)?,
-        project: PathBuf::from(row.get::<_, String>(1)?),
-        root: row.get(2)?,
+        backend,
+        project: PathBuf::from(row.get::<_, String>(2)?),
+        root: row.get(3)?,
         created_at: parse_time(created_at)?,
         expires_at: parse_time(expires_at)?,
         maximum_expires_at: parse_time(maximum_expires_at)?,
@@ -676,6 +699,7 @@ mod tests {
         let now = Utc::now();
         SessionRecord {
             id: "sbx_test".into(),
+            backend: BackendId::microsandbox(),
             project: PathBuf::from("/workspace/project"),
             root: "alpine".into(),
             created_at: now,
@@ -815,6 +839,55 @@ mod tests {
             .unwrap();
         store.activate("migrated").unwrap();
         assert_eq!(store.active_reservations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migrates_sessions_created_before_backend_tracking() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    project TEXT NOT NULL,
+                    root TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    maximum_expires_at INTEGER NOT NULL,
+                    ports_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        let now = Utc::now();
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                    id, project, root, created_at, expires_at, maximum_expires_at, ports_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "legacy",
+                    "/workspace/project",
+                    "image:alpine",
+                    now.timestamp(),
+                    (now + chrono::Duration::minutes(30)).timestamp(),
+                    (now + chrono::Duration::hours(8)).timestamp(),
+                    "[]",
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(
+            store.get("legacy").unwrap().backend,
+            BackendId::microsandbox()
+        );
+        store.insert(&record()).unwrap();
+        assert_eq!(
+            store.get("sbx_test").unwrap().backend,
+            BackendId::microsandbox()
+        );
     }
 
     #[test]

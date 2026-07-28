@@ -11,9 +11,10 @@ Important options:
 - `--project PATH`
 - `--env auto|go@VERSION|rust@VERSION|node@VERSION`
 - `--image OCI_REF` or `--snapshot NAME`
+- `--backend microsandbox|qemu`
 - `--cpus N`, `--memory SIZE`, `--disk SIZE`
 - `--user USER`, `--security default|restricted`
-- `--project-mode copy|mount-ro|mount-rw`
+- `--project-mode none|copy|mount-ro|mount-rw`
 - `--network off|public|dependencies|rules|all`
 - custom rules: `--allow-domain`, `--deny-domain`,
   `--allow-domain-suffix`, `--deny-domain-suffix`, `--allow-cidr`,
@@ -28,6 +29,31 @@ Important options:
 `--image` takes precedence over `--snapshot`, which takes precedence over
 `--env`. Text output preserves guest stdout/stderr. JSON contains bounded
 tails. JSONL emits streaming control and output events.
+
+## QEMU machine boot
+
+```bash
+asbx backend list --json
+asbx doctor --backend qemu
+
+id="$(asbx open --backend qemu --root-disk ./guest.qcow2 \
+  --firmware ./QEMU_EFI.fd --project-mode none --network off)"
+asbx inspect "$id" --json
+asbx close "$id"
+```
+
+Machine inputs are `--root-disk`, `--disk-format raw|qcow2`, `--kernel`,
+`--initrd`, `--dtb`, `--firmware`, `--arch`, `--machine`, `--cpu`,
+`--accelerator`, and repeatable `--kernel-append`. `--gdb [PORT]` exposes a
+loopback GDB stub; `--pause-at-boot` starts CPUs paused. An omitted GDB port is
+allocated automatically and reported by `inspect`.
+
+QEMU machine mode defaults to `--project-mode none` and `--network off`.
+Writable disks use a temporary snapshot and do not mutate the base image.
+Guests need an SSH service plus `qemu.ssh_user`/`qemu.ssh_key` (or `--user`)
+for copy mode, command execution, shell access, and file transfer. QEMU
+currently supports only `off` and host-gated `all`; filtered egress modes stay
+on Microsandbox.
 
 Copy mode honors `.gitignore` and `.agent-sandbox-ignore`. Keep generated,
 vendored, or local runtime source trees out of the guest through those files;
@@ -72,7 +98,8 @@ asbx env create NAME --base ubuntu:24.04 \
 asbx env list [--json]
 asbx env inspect NAME [--json]
 asbx env remove NAME
-asbx doctor [--json]
+asbx doctor [--backend microsandbox|qemu] [--json]
+asbx backend list [--json]
 asbx cache status [--json]
 asbx cache prune [--max-size SIZE] [--older-than DURATION] \
   [--include-environments] [--dry-run] [--json]

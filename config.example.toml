@@ -5,6 +5,14 @@ max_reserved_memory = "12G"
 default_ttl = "30m"
 max_ttl = "8h"
 
+[qemu]
+# binary = "/opt/homebrew/bin/qemu-system-aarch64"
+# ssh_binary = "/usr/bin/ssh"
+# ssh_user = "root"
+# ssh_key = "/Users/example/.ssh/qemu_guest"
+boot_timeout = "2m"
+shutdown_timeout = "10s"
+
 [workspace]
 roots = []
 allow_rw_mount = false

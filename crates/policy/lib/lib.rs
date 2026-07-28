@@ -10,8 +10,8 @@ use std::{
 };
 
 use agent_sandbox_runtime::{
-    NetworkMode, NetworkRule, NetworkRuleAction, NetworkRuleTarget, PortMapping, ProjectMode,
-    RootSource, SecurityMode,
+    BackendId, NetworkMode, NetworkRule, NetworkRuleAction, NetworkRuleTarget, PortMapping,
+    ProjectMode, RootSource, SecurityMode,
 };
 use ipnet::IpNet;
 use serde::Deserialize;
@@ -86,6 +86,8 @@ pub enum PolicyError {
 pub struct HostConfig {
     /// Runtime lifetime and concurrency settings.
     pub runtime: RuntimeConfig,
+    /// QEMU backend process and guest-transport settings.
+    pub qemu: QemuConfig,
     /// Authorized workspace roots.
     pub workspace: WorkspaceConfig,
     /// Network policy gates.
@@ -114,6 +116,24 @@ pub struct RuntimeConfig {
     pub default_ttl: String,
     /// Maximum runtime TTL.
     pub max_ttl: String,
+}
+
+/// QEMU backend host settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QemuConfig {
+    /// Explicit `qemu-system-*` executable.
+    pub binary: Option<PathBuf>,
+    /// Explicit OpenSSH client executable.
+    pub ssh_binary: Option<PathBuf>,
+    /// Default SSH login. Omit to disable guest command/file transport.
+    pub ssh_user: Option<String>,
+    /// Optional SSH private key.
+    pub ssh_key: Option<PathBuf>,
+    /// QMP and optional SSH readiness deadline.
+    pub boot_timeout: String,
+    /// Graceful ACPI shutdown deadline.
+    pub shutdown_timeout: String,
 }
 
 /// Workspace boundary settings.
@@ -197,6 +217,8 @@ pub struct CacheConfig {
 /// User-selectable sandbox settings before policy enforcement.
 #[derive(Debug, Clone)]
 pub struct RequestedSpec {
+    /// Selected runtime backend.
+    pub backend: BackendId,
     /// Root source selected by environment resolution.
     pub root: RootSource,
     /// Project path.
@@ -230,6 +252,8 @@ pub struct RequestedSpec {
 /// Policy-approved values.
 #[derive(Debug, Clone)]
 pub struct EffectiveSpec {
+    /// Selected runtime backend.
+    pub backend: BackendId,
     /// Canonical project path.
     pub project: PathBuf,
     /// Root filesystem source.
@@ -295,6 +319,19 @@ impl Default for RuntimeConfig {
             max_reserved_memory: "12G".into(),
             default_ttl: "30m".into(),
             max_ttl: "8h".into(),
+        }
+    }
+}
+
+impl Default for QemuConfig {
+    fn default() -> Self {
+        Self {
+            binary: None,
+            ssh_binary: None,
+            ssh_user: None,
+            ssh_key: None,
+            boot_timeout: "2m".into(),
+            shutdown_timeout: "10s".into(),
         }
     }
 }
@@ -400,11 +437,36 @@ impl HostConfig {
         requested: RequestedSpec,
         invocation_root: &Path,
     ) -> Result<EffectiveSpec> {
-        if self.runtime.backend != "microsandbox" {
+        if !matches!(
+            self.runtime.backend.as_str(),
+            BackendId::MICROSANDBOX | BackendId::QEMU
+        ) {
             return Err(PolicyError::Forbidden(format!(
                 "unsupported runtime backend {:?}",
                 self.runtime.backend
             )));
+        }
+        if !matches!(
+            requested.backend.as_str(),
+            BackendId::MICROSANDBOX | BackendId::QEMU
+        ) {
+            return Err(PolicyError::Forbidden(format!(
+                "unsupported runtime backend {:?}",
+                requested.backend
+            )));
+        }
+        match (requested.backend.as_str(), &requested.root) {
+            (BackendId::MICROSANDBOX, RootSource::Machine(_)) => {
+                return Err(PolicyError::Forbidden(
+                    "machine boot sources require the qemu backend".into(),
+                ));
+            }
+            (BackendId::QEMU, RootSource::Image(_) | RootSource::Snapshot(_)) => {
+                return Err(PolicyError::Forbidden(
+                    "the qemu backend requires a machine boot source".into(),
+                ));
+            }
+            _ => {}
         }
         let project =
             requested
@@ -464,7 +526,7 @@ impl HostConfig {
         let network_rules = self.validate_network_rules(network, requested.network_rules)?;
 
         let rw_mount_quota_mib = match requested.project_mode {
-            ProjectMode::Copy | ProjectMode::MountReadOnly => None,
+            ProjectMode::None | ProjectMode::Copy | ProjectMode::MountReadOnly => None,
             ProjectMode::MountReadWrite => {
                 if !self.workspace.allow_rw_mount {
                     return Err(PolicyError::Forbidden(
@@ -505,6 +567,7 @@ impl HostConfig {
             })?;
 
         Ok(EffectiveSpec {
+            backend: requested.backend,
             project,
             root: requested.root,
             cpus,
@@ -850,7 +913,7 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use agent_sandbox_runtime::RootSource;
+    use agent_sandbox_runtime::{MachineBootSpec, RootSource};
     use tempfile::tempdir;
 
     use super::*;
@@ -933,8 +996,44 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn backend_and_boot_source_must_match() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut requested = request(project.clone());
+        requested.backend = BackendId::qemu();
+        assert!(matches!(
+            HostConfig::default().enforce(requested, root.path()),
+            Err(PolicyError::Forbidden(_))
+        ));
+
+        let mut requested = request(project);
+        requested.backend = BackendId::qemu();
+        requested.root = RootSource::Machine(Box::new(MachineBootSpec {
+            architecture: "aarch64".into(),
+            machine: None,
+            cpu: None,
+            accelerator: None,
+            disk: None,
+            kernel: Some(PathBuf::from("Image")),
+            initrd: None,
+            dtb: None,
+            firmware: None,
+            kernel_append: vec![],
+            debug: None,
+        }));
+        requested.project_mode = ProjectMode::None;
+        requested.network = Some(NetworkMode::Off);
+        let effective = HostConfig::default()
+            .enforce(requested, root.path())
+            .unwrap();
+        assert_eq!(effective.backend, BackendId::qemu());
+    }
+
     fn request(project: PathBuf) -> RequestedSpec {
         RequestedSpec {
+            backend: BackendId::microsandbox(),
             root: RootSource::Image("alpine".into()),
             project,
             cpus: None,

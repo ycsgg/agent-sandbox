@@ -6,10 +6,26 @@ Run:
 
 ```bash
 asbx doctor
+asbx doctor --backend qemu
 ```
 
 Resolve failed virtualization, `msb`, or `libkrunfw` checks. Do not run the
 project command on the host as a fallback.
+
+For QEMU, install the matching `qemu-system-ARCH` binary. Hardware
+acceleration is KVM on Linux, HVF on macOS, and WHPX on Windows; TCG is the
+portable fallback and is selected automatically for cross-architecture
+guests.
+
+## QEMU starts but guest commands are unavailable
+
+Lifecycle, serial logging, QMP, and GDB do not require a guest transport. For
+`copy`, `exec`, `shell`, or artifacts, the guest must run SSH and the host
+configuration must set `qemu.ssh_user` (and normally `qemu.ssh_key`), or the
+machine command must pass `--user`.
+
+Use `asbx inspect ID --json` to locate the serial log and active QMP, SSH, and
+GDB loopback endpoints. Use `--project-mode none` for machines without SSH.
 
 ## Auto detection fails
 
@@ -55,7 +71,9 @@ asbx close ID
 ```
 
 Every `asbx` invocation also reconciles expired wrapper leases. Microsandbox's
-runtime maximum duration is a second cleanup backstop.
+runtime maximum duration is a second cleanup backstop. QEMU does not install a
+persistent TTL helper, so an expired QEMU machine is reclaimed by the next
+`asbx` invocation.
 
 ## Artifact download is rejected
 

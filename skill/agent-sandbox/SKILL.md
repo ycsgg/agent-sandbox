@@ -17,6 +17,11 @@ install hooks, build scripts, tests, or downloaded binaries.
    debugging, or services.
 5. Use `asbx shell ID` only when an interactive terminal is necessary.
 
+Use the default Microsandbox backend for OCI images and project workflows.
+Select `--backend qemu` only when the task supplies a bootable disk or kernel
+and needs full-system, cross-architecture, serial, QMP, or GDB capabilities.
+Check available features with `asbx backend list --json`.
+
 Never run a project's install, build, test, or audit command directly on the
 host as a fallback. Diagnose the sandbox or ask the user how to proceed.
 

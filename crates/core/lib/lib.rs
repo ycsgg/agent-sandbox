@@ -17,9 +17,9 @@ use agent_sandbox_environment::{
 };
 use agent_sandbox_policy::{EffectiveSpec, HostConfig, RequestedSpec};
 use agent_sandbox_runtime::{
-    CreateSpec, ExecRequest, ExecStream, ImageInfo, NetworkMode, NetworkRule, NetworkRuleAction,
-    NetworkRuleTarget, PortMapping, ProjectMode, RootSource, SandboxInfo, SandboxRuntime,
-    SecurityMode, WorkspaceSpec,
+    BackendId, CreateSpec, ExecRequest, ExecStream, ImageInfo, MachineBootSpec, NetworkMode,
+    NetworkRule, NetworkRuleAction, NetworkRuleTarget, PortMapping, ProjectMode, RootSource,
+    SandboxInfo, SandboxRuntime, SecurityMode, WorkspaceSpec,
 };
 use agent_sandbox_state::{
     EnvironmentRecord, ReservationRecord, SessionRecord, StateError, StateStore,
@@ -89,6 +89,10 @@ pub enum CoreError {
 /// CLI-level sandbox options before environment and host policy resolution.
 #[derive(Debug, Clone)]
 pub struct SandboxOptions {
+    /// Explicit backend, or the host-configured default.
+    pub backend: Option<BackendId>,
+    /// Explicit full-system machine boot inputs.
+    pub machine: Option<MachineBootSpec>,
     /// Project directory.
     pub project: PathBuf,
     /// Explicit OCI image.
@@ -137,6 +141,8 @@ pub struct RequestedPort {
 pub struct OpenedSandbox {
     /// Sandbox identifier.
     pub id: String,
+    /// Selected runtime backend.
+    pub backend: BackendId,
     /// Resolved root source.
     pub root: RootSource,
     /// Effective project exposure mode.
@@ -405,6 +411,7 @@ impl AgentSandbox {
 
         let effective = self.config.enforce(
             RequestedSpec {
+                backend: BackendId::microsandbox(),
                 root: RootSource::Image(build.base.clone()),
                 project: self.invocation_root.clone(),
                 cpus: options.cpus,
@@ -838,21 +845,14 @@ impl AgentSandbox {
                 .map(|reservation| reservation.id),
         );
         let active = self.state.active_reservations()?;
-        if !active.is_empty() {
-            let runtime_ids = self
-                .runtime
-                .list()
-                .await?
-                .into_iter()
-                .filter(|sandbox| sandbox.status == "running")
-                .map(|sandbox| sandbox.id)
-                .collect::<BTreeSet<_>>();
-            expired.extend(
-                active
-                    .into_iter()
-                    .filter(|reservation| !runtime_ids.contains(&reservation.id))
-                    .map(|reservation| reservation.id),
-            );
+        for reservation in active {
+            match self.runtime.inspect(&reservation.id).await {
+                Ok(sandbox) if sandbox.is_active() => {}
+                Ok(_) | Err(agent_sandbox_runtime::RuntimeError::NotFound(_)) => {
+                    expired.insert(reservation.id);
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         let mut removed = Vec::new();
         for id in expired {
@@ -870,19 +870,12 @@ impl AgentSandbox {
 
     /// List wrapper sessions and correlate them with runtime state.
     pub async fn list(&self) -> Result<Vec<SessionView>> {
-        let runtime = self.runtime.list().await.unwrap_or_default();
-        Ok(self
-            .state
-            .list()?
-            .into_iter()
-            .map(|session| SessionView {
-                runtime: runtime
-                    .iter()
-                    .find(|sandbox| sandbox.id == session.id)
-                    .cloned(),
-                session,
-            })
-            .collect())
+        let mut views = Vec::new();
+        for session in self.state.list()? {
+            let runtime = self.runtime.inspect(&session.id).await.ok();
+            views.push(SessionView { session, runtime });
+        }
+        Ok(views)
     }
 
     /// Inspect one wrapper session.
@@ -998,21 +991,47 @@ impl AgentSandbox {
         detached: bool,
         persist_session: bool,
     ) -> Result<OpenedSandbox> {
+        let backend = match options.backend.clone() {
+            Some(backend) => backend,
+            None => BackendId::new(self.config.runtime.backend.clone())?,
+        };
         let requested_network = options.network;
         let mut network_rules = options.network_rules;
         if requested_network == Some(NetworkMode::Dependencies) {
             network_rules.extend(dependency_network_rules(&options.project)?);
         }
-        let named_environment = if options.image.is_none() && options.snapshot.is_none() {
-            options
-                .environment
-                .as_deref()
-                .filter(|expression| *expression != "auto" && !expression.contains('@'))
-                .map(str::to_owned)
-        } else {
-            None
-        };
-        let (resolved, named_record) = if let Some(name) = named_environment {
+        if options.machine.is_some()
+            && (options.image.is_some()
+                || options.snapshot.is_some()
+                || options
+                    .environment
+                    .as_deref()
+                    .is_some_and(|value| value != "auto"))
+        {
+            return Err(CoreError::InvalidOperation(
+                "machine boot inputs cannot be combined with --image, --snapshot, or --env".into(),
+            ));
+        }
+        let named_environment =
+            if options.machine.is_none() && options.image.is_none() && options.snapshot.is_none() {
+                options
+                    .environment
+                    .as_deref()
+                    .filter(|expression| *expression != "auto" && !expression.contains('@'))
+                    .map(str::to_owned)
+            } else {
+                None
+            };
+        let (resolved, named_record) = if let Some(machine) = options.machine {
+            (
+                ResolvedEnvironment {
+                    root: RootSource::Machine(Box::new(machine)),
+                    detection: None,
+                    source: "machine boot specification".into(),
+                },
+                None,
+            )
+        } else if let Some(name) = named_environment {
             let record = self.state.get_environment(&name)?;
             self.runtime.inspect_snapshot(&record.snapshot).await?;
             (
@@ -1039,6 +1058,7 @@ impl AgentSandbox {
         let ports = resolve_ports(options.ports)?;
         let effective = self.config.enforce(
             RequestedSpec {
+                backend: backend.clone(),
                 root: resolved.root.clone(),
                 project: options.project,
                 cpus: options.cpus,
@@ -1057,7 +1077,11 @@ impl AgentSandbox {
             &self.invocation_root,
         )?;
         let transfer = build_transfer_plan(&effective)?;
-        let id = format!("sbx_{}", Ulid::new().to_string().to_ascii_lowercase());
+        let id = format!(
+            "sbx_{}_{}",
+            backend.as_str(),
+            Ulid::new().to_string().to_ascii_lowercase()
+        );
         let create_spec = runtime_spec(&id, &effective, detached);
         let now = Utc::now();
         let reservation = ReservationRecord {
@@ -1081,7 +1105,9 @@ impl AgentSandbox {
             return Err(error.into());
         }
 
-        if let Err(error) = self.prepare_workspace(&id, transfer.as_ref()).await {
+        if effective.project_mode != ProjectMode::None
+            && let Err(error) = self.prepare_workspace(&id, transfer.as_ref()).await
+        {
             let _ = self.cleanup(&id).await;
             return Err(error);
         }
@@ -1095,6 +1121,7 @@ impl AgentSandbox {
         if persist_session {
             let record = SessionRecord {
                 id: id.clone(),
+                backend: backend.clone(),
                 project: effective.project.clone(),
                 root: root_description(&resolved),
                 created_at: now,
@@ -1116,6 +1143,7 @@ impl AgentSandbox {
 
         Ok(OpenedSandbox {
             id,
+            backend,
             root: resolved.root,
             project_mode: effective.project_mode,
             network: effective.network,
@@ -1220,6 +1248,7 @@ fn build_transfer_plan(effective: &EffectiveSpec) -> Result<Option<TransferPlan>
 
 fn runtime_spec(id: &str, effective: &EffectiveSpec, detached: bool) -> CreateSpec {
     let workspace = match effective.project_mode {
+        ProjectMode::None => WorkspaceSpec::None,
         ProjectMode::Copy => WorkspaceSpec::Copy,
         ProjectMode::MountReadOnly => WorkspaceSpec::Mount {
             host: effective.project.clone(),
@@ -1234,6 +1263,7 @@ fn runtime_spec(id: &str, effective: &EffectiveSpec, detached: bool) -> CreateSp
     };
     CreateSpec {
         id: id.into(),
+        backend: effective.backend.clone(),
         root: effective.root.clone(),
         cpus: effective.cpus,
         memory_mib: effective.memory_mib,
@@ -1407,6 +1437,21 @@ fn root_description(resolved: &ResolvedEnvironment) -> String {
     match &resolved.root {
         RootSource::Image(image) => format!("image:{image}"),
         RootSource::Snapshot(snapshot) => format!("snapshot:{snapshot}"),
+        RootSource::Machine(machine) => format!(
+            "machine:{}:{}",
+            machine.architecture,
+            machine
+                .disk
+                .as_ref()
+                .map(|disk| disk.path.display().to_string())
+                .or_else(|| {
+                    machine
+                        .kernel
+                        .as_ref()
+                        .map(|kernel| kernel.display().to_string())
+                })
+                .unwrap_or_else(|| "unconfigured".into())
+        ),
     }
 }
 
@@ -1422,8 +1467,8 @@ mod tests {
     };
 
     use agent_sandbox_runtime::{
-        ExecEvent, GuestEntry, ImageInfo, Result as RuntimeResult, RuntimeError, SandboxRuntime,
-        SnapshotInfo,
+        BackendCapabilities, BootSourceKind, ExecEvent, GuestEntry, ImageInfo,
+        Result as RuntimeResult, RuntimeError, RuntimeFeature, SandboxRuntime, SnapshotInfo,
     };
     use async_trait::async_trait;
     use tempfile::tempdir;
@@ -1450,6 +1495,20 @@ mod tests {
 
     #[async_trait]
     impl SandboxRuntime for MockRuntime {
+        fn backend_id(&self) -> BackendId {
+            BackendId::microsandbox()
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                backend: self.backend_id(),
+                boot_sources: vec![BootSourceKind::OciImage],
+                features: vec![RuntimeFeature::Exec],
+                architectures: vec![],
+                accelerators: vec![],
+            }
+        }
+
         async fn create(&self, spec: &CreateSpec) -> RuntimeResult<SandboxInfo> {
             let mut state = self.state.lock().unwrap();
             state.existing = true;
@@ -1670,6 +1729,8 @@ mod tests {
 
         let opened = service
             .open(SandboxOptions {
+                backend: Some(BackendId::microsandbox()),
+                machine: None,
                 project,
                 image: Some("alpine:3.22".into()),
                 snapshot: None,
@@ -1819,6 +1880,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_boot_is_namespaced_and_skips_guest_workspace_setup() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let kernel = root.path().join("Image");
+        std::fs::write(&kernel, []).unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        let service = AgentSandbox::new(
+            runtime.clone(),
+            StateStore::open(root.path().join("state.db")).unwrap(),
+            HostConfig::default(),
+            root.path(),
+        )
+        .unwrap();
+        let mut requested = options(&project, ProjectMode::None);
+        requested.backend = Some(BackendId::qemu());
+        requested.machine = Some(MachineBootSpec {
+            architecture: "aarch64".into(),
+            machine: None,
+            cpu: None,
+            accelerator: Some("tcg".into()),
+            disk: None,
+            kernel: Some(kernel),
+            initrd: None,
+            dtb: None,
+            firmware: None,
+            kernel_append: vec![],
+            debug: None,
+        });
+        requested.image = None;
+        requested.environment = None;
+
+        let opened = service.create_one_shot(requested).await.unwrap();
+        assert!(opened.id.starts_with("sbx_qemu_"));
+        assert_eq!(opened.backend, BackendId::qemu());
+        assert_eq!(
+            runtime.state.lock().unwrap().operations,
+            vec!["create".to_owned()]
+        );
+        service.cleanup(&opened.id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn dependency_network_is_inferred_without_running_project_code() {
         let root = tempdir().unwrap();
         let project = root.path().join("project");
@@ -1948,6 +2052,8 @@ mod tests {
 
     fn options(project: &Path, project_mode: ProjectMode) -> SandboxOptions {
         SandboxOptions {
+            backend: Some(BackendId::microsandbox()),
+            machine: None,
             project: project.into(),
             image: Some("alpine:3.22".into()),
             snapshot: None,
@@ -1970,8 +2076,10 @@ mod tests {
     fn info(id: &str) -> SandboxInfo {
         SandboxInfo {
             id: id.into(),
+            backend: BackendId::microsandbox(),
             status: "running".into(),
             created_at: None,
+            metadata: BTreeMap::new(),
         }
     }
 }

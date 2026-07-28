@@ -17,10 +17,12 @@ use agent_sandbox_core::{
 use agent_sandbox_exec::{ExecSummary, OutputFormat, forward};
 use agent_sandbox_policy::{HostConfig, parse_duration};
 use agent_sandbox_runtime::{
-    ExecRequest, NetworkMode, NetworkRule, NetworkRuleAction, NetworkRuleTarget, ProjectMode,
+    BackendId, DiskImageFormat, DiskImageSpec, ExecRequest, MachineBootSpec, MachineDebugSpec,
+    NetworkMode, NetworkRule, NetworkRuleAction, NetworkRuleTarget, ProjectMode, RuntimeRegistry,
     SecurityMode,
 };
 use agent_sandbox_runtime_msb::MicrosandboxRuntime;
+use agent_sandbox_runtime_qemu::{QemuRuntime, QemuRuntimeConfig};
 use agent_sandbox_state::StateStore;
 use anyhow::{Context, Result, bail};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -52,11 +54,19 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Diagnose Microsandbox runtime and host prerequisites.
+    /// Diagnose runtime and host prerequisites.
     Doctor {
+        /// Backend to diagnose; defaults to runtime.backend.
+        #[arg(long)]
+        backend: Option<BackendArg>,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Discover registered runtime backends and capabilities.
+    Backend {
+        #[command(subcommand)]
+        command: BackendCommand,
     },
     /// Create a sandbox, execute one command, and always remove it.
     Run(RunArgs),
@@ -144,12 +154,15 @@ struct OpenArgs {
 
 #[derive(Debug, Args)]
 struct CommonSandboxArgs {
+    /// Runtime backend. Machine boot options imply qemu.
+    #[arg(long)]
+    backend: Option<BackendArg>,
     /// Project directory to copy or mount at `/workspace`.
     #[arg(long, default_value = ".")]
     project: PathBuf,
     /// Project exposure mode. Writable mounts require explicit host policy.
-    #[arg(long, default_value = "copy")]
-    project_mode: ProjectModeArg,
+    #[arg(long)]
+    project_mode: Option<ProjectModeArg>,
     /// Detect the environment, use `LANG@VERSION`, or select a named environment.
     #[arg(long = "env", default_value = "auto")]
     environment: String,
@@ -159,6 +172,48 @@ struct CommonSandboxArgs {
     /// Use a Microsandbox snapshot. Takes precedence over --env.
     #[arg(long)]
     snapshot: Option<String>,
+    /// Bootable raw or qcow2 disk for the QEMU backend.
+    #[arg(long)]
+    root_disk: Option<PathBuf>,
+    /// Root-disk image format. Inferred from `.qcow2` when omitted.
+    #[arg(long)]
+    disk_format: Option<DiskFormatArg>,
+    /// Attach the QEMU root disk read-only instead of using a temporary writable snapshot.
+    #[arg(long)]
+    root_disk_read_only: bool,
+    /// Direct-boot kernel image for the QEMU backend.
+    #[arg(long)]
+    kernel: Option<PathBuf>,
+    /// Direct-boot initramfs.
+    #[arg(long, requires = "kernel")]
+    initrd: Option<PathBuf>,
+    /// Device-tree blob.
+    #[arg(long, requires = "kernel")]
+    dtb: Option<PathBuf>,
+    /// Platform firmware image.
+    #[arg(long)]
+    firmware: Option<PathBuf>,
+    /// Guest architecture (`x86_64`, `aarch64`, or `riscv64`).
+    #[arg(long)]
+    arch: Option<String>,
+    /// QEMU machine type override.
+    #[arg(long)]
+    machine: Option<String>,
+    /// QEMU CPU model override.
+    #[arg(long)]
+    cpu: Option<String>,
+    /// QEMU accelerator (`auto`, `kvm`, `hvf`, `whpx`, or `tcg`).
+    #[arg(long)]
+    accelerator: Option<String>,
+    /// Append one token or fragment to the direct-boot kernel command line.
+    #[arg(long = "kernel-append", requires = "kernel")]
+    kernel_append: Vec<String>,
+    /// Enable a loopback-only QEMU GDB stub; omit PORT to allocate one.
+    #[arg(long, num_args = 0..=1, default_missing_value = "0", value_name = "PORT")]
+    gdb: Option<u16>,
+    /// Start QEMU CPUs paused for debugger attachment.
+    #[arg(long, requires = "gdb")]
+    pause_at_boot: bool,
     /// Guest virtual CPUs.
     #[arg(long)]
     cpus: Option<u8>,
@@ -376,9 +431,32 @@ enum CacheCommand {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ProjectModeArg {
+    None,
     Copy,
     MountRo,
     MountRw,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BackendArg {
+    Microsandbox,
+    Qemu,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum DiskFormatArg {
+    Raw,
+    Qcow2,
+}
+
+#[derive(Debug, Subcommand)]
+enum BackendCommand {
+    /// List backend feature declarations.
+    List {
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -434,20 +512,30 @@ async fn run(cli: Cli) -> Result<i32> {
     let state = StateStore::open_default()?;
     let state_path = state.path().to_path_buf();
     let root = std::env::current_dir().context("cannot read current directory")?;
-    let service = AgentSandbox::new(
-        Arc::new(MicrosandboxRuntime::default()),
-        state,
-        config,
-        &root,
-    )?;
+    let default_backend = BackendId::new(config.runtime.backend.clone())?;
+    let mut runtimes = RuntimeRegistry::new(default_backend.clone(), BackendId::microsandbox());
+    runtimes.register(Arc::new(MicrosandboxRuntime::default()))?;
+    runtimes.register(Arc::new(QemuRuntime::new(QemuRuntimeConfig {
+        home: state_path.parent().unwrap_or(Path::new(".")).join("qemu"),
+        binary: config.qemu.binary.clone(),
+        ssh_binary: config.qemu.ssh_binary.clone(),
+        ssh_user: config.qemu.ssh_user.clone(),
+        ssh_key: config.qemu.ssh_key.clone(),
+        boot_timeout: parse_duration(&config.qemu.boot_timeout)?,
+        shutdown_timeout: parse_duration(&config.qemu.shutdown_timeout)?,
+    })?))?;
+    runtimes.validate()?;
+    let runtimes = Arc::new(runtimes);
+    let service = AgentSandbox::new(runtimes.clone(), state, config, &root)?;
     let reclaimed = service.reconcile().await?;
     for id in reclaimed {
         tracing::info!(sandbox = %id, "reclaimed expired sandbox");
     }
 
     match cli.command {
-        Command::Doctor { json } => {
-            let checks = service.doctor().await?;
+        Command::Doctor { backend, json } => {
+            let backend = backend.map(BackendId::from).unwrap_or(default_backend);
+            let checks = runtimes.doctor_backend(&backend).await?;
             if json {
                 let values: Vec<_> = checks
                     .iter()
@@ -467,6 +555,26 @@ async fn run(cli: Cli) -> Result<i32> {
                 1
             })
         }
+        Command::Backend { command } => match command {
+            BackendCommand::List { json } => {
+                let capabilities = runtimes.all_capabilities();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&capabilities)?);
+                } else {
+                    for capability in capabilities {
+                        println!(
+                            "{}\tboot={}\tfeatures={}\tarch={}\taccel={}",
+                            capability.backend,
+                            join_debug(&capability.boot_sources),
+                            join_debug(&capability.features),
+                            capability.architectures.join(","),
+                            capability.accelerators.join(",")
+                        );
+                    }
+                }
+                Ok(0)
+            }
+        },
         Command::Run(arguments) => run_one_shot(&service, arguments).await,
         Command::Open(arguments) => {
             let output = arguments.output;
@@ -525,8 +633,9 @@ async fn run(cli: Cli) -> Result<i32> {
                         .map(|runtime| runtime.status.as_str())
                         .unwrap_or("missing");
                     println!(
-                        "{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}",
                         view.session.id,
+                        view.session.backend,
                         status,
                         view.session.expires_at.to_rfc3339(),
                         view.session.project.display()
@@ -541,6 +650,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 println!("{}", serde_json::to_string_pretty(&view)?);
             } else {
                 println!("id: {}", view.session.id);
+                println!("backend: {}", view.session.backend);
                 println!("project: {}", view.session.project.display());
                 println!("root: {}", view.session.root);
                 println!("expires: {}", view.session.expires_at.to_rfc3339());
@@ -856,17 +966,21 @@ async fn create_environment(service: &AgentSandbox, arguments: EnvCreateArgs) ->
 
 async fn run_one_shot(service: &AgentSandbox, arguments: RunArgs) -> Result<i32> {
     let output = arguments.output;
+    let options = sandbox_options(arguments.sandbox)?;
+    let cwd = if options.project_mode == ProjectMode::None {
+        "/"
+    } else {
+        "/workspace"
+    };
     let command = exec_request(
         arguments.command,
-        Some("/workspace".into()),
+        Some(cwd.into()),
         None,
-        vec![],
-        arguments.sandbox.timeout,
+        options.env.clone(),
+        options.timeout,
         false,
     )?;
-    let opened = service
-        .create_one_shot(sandbox_options(arguments.sandbox)?)
-        .await?;
+    let opened = service.create_one_shot(options).await?;
     if output == OutputArg::Jsonl {
         println!(
             "{}",
@@ -952,7 +1066,108 @@ fn print_summary(summary: &ExecSummary) -> Result<()> {
 }
 
 fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOptions> {
-    let project_mode = match arguments.project_mode {
+    let machine_requested = arguments.root_disk.is_some()
+        || arguments.kernel.is_some()
+        || arguments.initrd.is_some()
+        || arguments.dtb.is_some()
+        || arguments.firmware.is_some()
+        || arguments.arch.is_some()
+        || arguments.machine.is_some()
+        || arguments.cpu.is_some()
+        || arguments.accelerator.is_some()
+        || !arguments.kernel_append.is_empty()
+        || arguments.gdb.is_some();
+    let backend = match (arguments.backend, machine_requested) {
+        (Some(backend), _) => Some(BackendId::from(backend)),
+        (None, true) => Some(BackendId::qemu()),
+        (None, false) => None,
+    };
+    if backend
+        .as_ref()
+        .is_some_and(|backend| backend.as_str() == BackendId::QEMU)
+        && !machine_requested
+    {
+        bail!("the qemu backend requires --root-disk and/or --kernel");
+    }
+    if arguments.disk_format.is_some() && arguments.root_disk.is_none() {
+        bail!("--disk-format requires --root-disk");
+    }
+    if arguments.root_disk_read_only && arguments.root_disk.is_none() {
+        bail!("--root-disk-read-only requires --root-disk");
+    }
+    if machine_requested && arguments.disk.is_some() {
+        bail!("--disk controls Microsandbox root size and cannot be used with QEMU machine boot");
+    }
+    let machine = if machine_requested {
+        let disk = arguments
+            .root_disk
+            .as_deref()
+            .map(|path| {
+                let path = canonical_input("root disk", path)?;
+                let format = arguments
+                    .disk_format
+                    .map(DiskImageFormat::from)
+                    .unwrap_or_else(|| {
+                        if path
+                            .extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("qcow2"))
+                        {
+                            DiskImageFormat::Qcow2
+                        } else {
+                            DiskImageFormat::Raw
+                        }
+                    });
+                Ok::<DiskImageSpec, anyhow::Error>(DiskImageSpec {
+                    path,
+                    format,
+                    read_only: arguments.root_disk_read_only,
+                })
+            })
+            .transpose()?;
+        Some(MachineBootSpec {
+            architecture: arguments
+                .arch
+                .clone()
+                .unwrap_or_else(|| std::env::consts::ARCH.into()),
+            machine: arguments.machine.clone(),
+            cpu: arguments.cpu.clone(),
+            accelerator: arguments.accelerator.clone(),
+            disk,
+            kernel: arguments
+                .kernel
+                .as_deref()
+                .map(|path| canonical_input("kernel", path))
+                .transpose()?,
+            initrd: arguments
+                .initrd
+                .as_deref()
+                .map(|path| canonical_input("initrd", path))
+                .transpose()?,
+            dtb: arguments
+                .dtb
+                .as_deref()
+                .map(|path| canonical_input("DTB", path))
+                .transpose()?,
+            firmware: arguments
+                .firmware
+                .as_deref()
+                .map(|path| canonical_input("firmware", path))
+                .transpose()?,
+            kernel_append: arguments.kernel_append.clone(),
+            debug: arguments.gdb.map(|gdb_port| MachineDebugSpec {
+                gdb_port,
+                pause_at_boot: arguments.pause_at_boot,
+            }),
+        })
+    } else {
+        None
+    };
+    let project_mode = match arguments.project_mode.unwrap_or(if machine_requested {
+        ProjectModeArg::None
+    } else {
+        ProjectModeArg::Copy
+    }) {
+        ProjectModeArg::None => ProjectMode::None,
         ProjectModeArg::Copy => ProjectMode::Copy,
         ProjectModeArg::MountRo => ProjectMode::MountReadOnly,
         ProjectModeArg::MountRw => ProjectMode::MountReadWrite,
@@ -1029,7 +1244,23 @@ fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOptions> {
             });
         }
     }
+    let network = arguments
+        .network
+        .map(|network| match network {
+            NetworkArg::Off => NetworkMode::Off,
+            NetworkArg::Public => NetworkMode::Public,
+            NetworkArg::Dependencies => NetworkMode::Dependencies,
+            NetworkArg::Rules => NetworkMode::Rules,
+            NetworkArg::All => NetworkMode::All,
+        })
+        .or(if machine_requested {
+            Some(NetworkMode::Off)
+        } else {
+            None
+        });
     Ok(SandboxOptions {
+        backend,
+        machine,
         project: arguments.project,
         image: arguments.image,
         snapshot: arguments.snapshot,
@@ -1042,13 +1273,7 @@ fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOptions> {
             SecurityArg::Default => SecurityMode::Default,
             SecurityArg::Restricted => SecurityMode::Restricted,
         },
-        network: arguments.network.map(|network| match network {
-            NetworkArg::Off => NetworkMode::Off,
-            NetworkArg::Public => NetworkMode::Public,
-            NetworkArg::Dependencies => NetworkMode::Dependencies,
-            NetworkArg::Rules => NetworkMode::Rules,
-            NetworkArg::All => NetworkMode::All,
-        }),
+        network,
         network_rules,
         project_mode,
         timeout: arguments.timeout,
@@ -1056,6 +1281,42 @@ fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOptions> {
         env: arguments.env_vars,
         ports: arguments.publish,
     })
+}
+
+fn canonical_input(label: &str, path: &Path) -> Result<PathBuf> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {label} {}", path.display()))?;
+    if !path.is_file() {
+        bail!("{label} {} is not a regular file", path.display());
+    }
+    Ok(path)
+}
+
+fn join_debug<T: std::fmt::Debug>(values: &[T]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:?}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+impl From<BackendArg> for BackendId {
+    fn from(value: BackendArg) -> Self {
+        match value {
+            BackendArg::Microsandbox => Self::microsandbox(),
+            BackendArg::Qemu => Self::qemu(),
+        }
+    }
+}
+
+impl From<DiskFormatArg> for DiskImageFormat {
+    fn from(value: DiskFormatArg) -> Self {
+        match value {
+            DiskFormatArg::Raw => Self::Raw,
+            DiskFormatArg::Qcow2 => Self::Qcow2,
+        }
+    }
 }
 
 fn extend_string_rules(

@@ -10,9 +10,10 @@ use std::{
 };
 
 use agent_sandbox_runtime::{
-    CreateSpec, ExecEvent, ExecRequest, ExecStream, GuestEntry, ImageInfo, NetworkMode,
-    NetworkRule, NetworkRuleAction, NetworkRuleTarget, OutputStream, Result, RootSource,
-    RuntimeError, SandboxInfo, SandboxRuntime, SecurityMode, SnapshotInfo, WorkspaceSpec,
+    BackendCapabilities, BackendId, BootSourceKind, CreateSpec, ExecEvent, ExecRequest, ExecStream,
+    GuestEntry, ImageInfo, NetworkMode, NetworkRule, NetworkRuleAction, NetworkRuleTarget,
+    OutputStream, Result, RootSource, RuntimeError, RuntimeFeature, SandboxInfo, SandboxRuntime,
+    SecurityMode, SnapshotInfo, WorkspaceSpec,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -41,7 +42,37 @@ pub struct MicrosandboxRuntime {
 
 #[async_trait]
 impl SandboxRuntime for MicrosandboxRuntime {
+    fn backend_id(&self) -> BackendId {
+        BackendId::microsandbox()
+    }
+
+    fn capabilities(&self) -> BackendCapabilities {
+        BackendCapabilities {
+            backend: self.backend_id(),
+            boot_sources: vec![BootSourceKind::OciImage, BootSourceKind::Snapshot],
+            features: vec![
+                RuntimeFeature::Exec,
+                RuntimeFeature::Attach,
+                RuntimeFeature::FileTransfer,
+                RuntimeFeature::ReadOnlyMount,
+                RuntimeFeature::ReadWriteMount,
+                RuntimeFeature::PortForward,
+                RuntimeFeature::NetworkRules,
+                RuntimeFeature::Snapshots,
+                RuntimeFeature::ImageCache,
+            ],
+            architectures: vec!["x86_64".into(), "aarch64".into()],
+            accelerators: platform_accelerators(),
+        }
+    }
+
     async fn create(&self, spec: &CreateSpec) -> Result<SandboxInfo> {
+        if spec.backend != self.backend_id() {
+            return Err(RuntimeError::Configuration(format!(
+                "Microsandbox received a create request for backend {:?}",
+                spec.backend
+            )));
+        }
         let mut builder = Sandbox::builder(&spec.id)
             .cpus(spec.cpus)
             .memory(spec.memory_mib)
@@ -57,6 +88,11 @@ impl SandboxRuntime for MicrosandboxRuntime {
         builder = match &spec.root {
             RootSource::Image(image) => builder.image(image.as_str()).root_disk(spec.disk_mib),
             RootSource::Snapshot(snapshot) => builder.from_snapshot(snapshot),
+            RootSource::Machine(_) => {
+                return Err(RuntimeError::Unsupported(
+                    "Microsandbox does not accept full-system machine boot specifications".into(),
+                ));
+            }
         };
         builder = match spec.network {
             NetworkMode::Off => builder.disable_network(),
@@ -116,8 +152,10 @@ impl SandboxRuntime for MicrosandboxRuntime {
         }
         Ok(SandboxInfo {
             id: sandbox.name().into(),
+            backend: self.backend_id(),
             status: status_name(status),
             created_at: None,
+            metadata: BTreeMap::new(),
         })
     }
 
@@ -458,8 +496,10 @@ impl SandboxRuntime for MicrosandboxRuntime {
             .into_iter()
             .map(|handle| SandboxInfo {
                 id: handle.name().into(),
+                backend: self.backend_id(),
                 status: status_name(handle.status_snapshot()),
                 created_at: handle.created_at(),
+                metadata: BTreeMap::new(),
             })
             .collect())
     }
@@ -470,8 +510,10 @@ impl SandboxRuntime for MicrosandboxRuntime {
             .map_err(|error| backend("inspect sandbox", error))?;
         Ok(SandboxInfo {
             id: handle.name().into(),
+            backend: self.backend_id(),
             status: status_name(handle.status_snapshot()),
             created_at: handle.created_at(),
+            metadata: BTreeMap::new(),
         })
     }
 
@@ -567,6 +609,25 @@ impl SandboxRuntime for MicrosandboxRuntime {
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+fn platform_accelerators() -> Vec<String> {
+    #[cfg(target_os = "linux")]
+    {
+        vec!["kvm".into()]
+    }
+    #[cfg(target_os = "macos")]
+    {
+        vec!["hvf".into()]
+    }
+    #[cfg(target_os = "windows")]
+    {
+        vec!["whpx".into()]
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        Vec::new()
+    }
+}
 
 impl MicrosandboxRuntime {
     async fn connect(&self, name: &str) -> Result<Sandbox> {

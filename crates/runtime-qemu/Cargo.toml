@@ -1,5 +1,5 @@
 [package]
-name = "agent-sandbox-state"
+name = "agent-sandbox-runtime-qemu"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,13 +10,14 @@ path = "lib/lib.rs"
 
 [dependencies]
 agent-sandbox-runtime.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
 chrono.workspace = true
-dirs.workspace = true
-rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sysinfo.workspace = true
-thiserror.workspace = true
+tokio.workspace = true
+which.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

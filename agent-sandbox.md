@@ -6,13 +6,16 @@
 
 - 根据项目声明识别 Go、Rust、Node.js、TypeScript 等运行环境及版本。
 - 使用预置环境、任意 OCI 镜像或 Microsandbox snapshot。
+- 使用 QEMU 启动磁盘镜像、自定义 kernel/initrd/DTB 和不同 CPU 架构。
 - 创建一次性 sandbox，执行编译、测试、审计和验证命令。
 - 在同一个 sandbox 中进行多轮操作。
 - 启动服务并通过宿主本地端口访问。
 - 取回报告、日志和构建产物。
 - 完成后销毁 sandbox，不留下常驻 VM 或 daemon。
 
-底层第一阶段使用 [Microsandbox](microsandbox/README.md)，但 wrapper 通过 backend trait 隔离具体实现，避免上层接口与 Microsandbox 强耦合。
+底层通过 backend registry 同时支持 Microsandbox 和 QEMU。Microsandbox
+负责快速 OCI 工作流；QEMU 负责完整系统启动、跨架构、串口、QMP 和 GDB
+stub。上层 core、lease 和状态模型不与任一 backend 强耦合。
 
 ## 2. 威胁模型
 
@@ -24,7 +27,7 @@
 - AI Agent 及其决策。
 - Agent Sandbox wrapper。
 - 由我们维护的基础镜像、环境目录和 provisioning 脚本。
-- Microsandbox、libkrun、宿主 hypervisor 和宿主内核。
+- Microsandbox、libkrun、QEMU、宿主 hypervisor 和宿主内核。
 
 Agent 可以自由选择命令、镜像、网络模式、guest 用户、资源和环境构建方式。wrapper 不需要防止一个主动恶意的 Agent 绕过产品意图。
 
@@ -73,9 +76,9 @@ asbx CLI
    ▼
 Agent Sandbox Core
    ▼
-Microsandbox SDK
-   ▼
-libkrun → KVM / Hypervisor.framework / WHP
+Runtime Registry
+   ├── Microsandbox SDK → libkrun → KVM / Hypervisor.framework / WHP
+   └── QEMU → KVM / HVF / WHPX / TCG
 ```
 
 不引入 MCP server，原因如下：
@@ -88,9 +91,11 @@ libkrun → KVM / Hypervisor.framework / WHP
 
 Skill 是使用说明和工作流，不承担强制隔离。即使 Agent 没有遵循 Skill，`asbx` 本身仍必须正确隔离不可信代码。
 
-### 3.2 先做 wrapper，不 fork Microsandbox
+### 3.2 多 backend wrapper，不 fork VMM
 
-第一阶段固定 Microsandbox 版本，通过 adapter 使用其 Rust SDK。
+固定 Microsandbox 版本并通过 adapter 使用其 Rust SDK；QEMU 通过独立
+adapter 调用系统安装的 `qemu-system-*`，使用 QMP 管理生命周期，使用可选
+SSH transport 提供命令和文件通道。
 
 只在出现 wrapper 无法解决的 core 问题时维护小型 patch branch，并优先向上游提交：
 
@@ -600,6 +605,7 @@ agent-sandbox/
 │   ├── environment/   # OCI、toolchain、snapshot
 │   ├── runtime/       # backend trait
 │   ├── runtime-msb/   # Microsandbox adapter
+│   ├── runtime-qemu/  # QEMU/QMP/SSH adapter
 │   ├── transfer/      # project/artifact broker
 │   ├── exec/          # streaming、timeout、output
 │   ├── state/         # SQLite、lease、reaper
@@ -668,6 +674,13 @@ max_reserved_memory = "12G"
 default_ttl = "30m"
 max_ttl = "8h"
 
+[qemu]
+# binary = "/usr/local/bin/qemu-system-aarch64"
+# ssh_user = "root"
+# ssh_key = "/Users/example/.ssh/qemu_guest"
+boot_timeout = "2m"
+shutdown_timeout = "10s"
+
 [workspace]
 roots = [
   "/Users/example/labs",
@@ -723,6 +736,8 @@ stop guest
 - TTL 到期后清理。
 - wrapper 启动时清理 stale lease。
 - 宿主重启后，下一次 `asbx` 调用触发 bounded reconciliation。
+- QEMU 不安装常驻 TTL helper；其到期 VM 在下一次 `asbx` 调用时回收。
+- Microsandbox 还使用 runtime maximum duration 作为独立的清理兜底。
 
 ### 14.3 保留内容
 
@@ -831,8 +846,9 @@ asbx CLI
 Agent Sandbox Core
   负责环境解析、宿主边界、生命周期、流式输出和缓存
 
-Microsandbox
-  负责 microVM、OCI rootfs、guest agent、网络和文件系统设备
+Runtime Backends
+  Microsandbox 负责 OCI、guest agent、精细网络和文件系统设备
+  QEMU 负责完整系统、跨架构、串口、QMP 和 GDB stub
 ```
 
 核心体验是“自由但有宿主边界”：
