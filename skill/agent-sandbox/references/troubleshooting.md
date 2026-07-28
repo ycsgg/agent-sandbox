@@ -24,9 +24,18 @@ pass an explicit `--env LANG@VERSION`.
 
 ## Dependency download fails
 
-Confirm that the sandbox uses `--network public`. Public mode intentionally
-blocks private registries and host services. Do not switch to `all` unless the
-host permits it and the task requires private access.
+Confirm that the sandbox uses `--network public`, or `dependencies` for
+detected Go/Cargo/npm registries. Custom `rules` mode is deny-by-default, so
+add each required domain or public port. These modes intentionally block
+private registries and host services. Do not switch to `all` unless the host
+permits it and the task requires private access.
+
+## Managed environment build fails
+
+Use a glibc base such as `ubuntu:24.04` or Debian when installing exact Node.js
+toolchains. Registry and toolchain downloads require public network access.
+Failed builders are removed and are not registered; rerun the same
+`asbx env create` after fixing the base or connectivity.
 
 ## Command times out or floods output
 

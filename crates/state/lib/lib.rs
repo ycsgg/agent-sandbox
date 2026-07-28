@@ -11,6 +11,7 @@ use std::{
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -46,6 +47,10 @@ pub enum StateError {
     /// Requested session does not exist.
     #[error("unknown sandbox session {0}")]
     NotFound(String),
+
+    /// Requested managed environment does not exist.
+    #[error("unknown managed environment {0}")]
+    EnvironmentNotFound(String),
 
     /// Concurrent-session limit was reached.
     #[error("sandbox concurrency limit reached ({0})")]
@@ -98,6 +103,31 @@ pub struct ReservationRecord {
     pub active: bool,
 }
 
+/// A reusable, wrapper-managed environment snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvironmentRecord {
+    /// User-facing environment name.
+    pub name: String,
+    /// Microsandbox snapshot name.
+    pub snapshot: String,
+    /// Deterministic build-input digest.
+    pub cache_key: String,
+    /// Base OCI image reference.
+    pub base: String,
+    /// Content-addressed base manifest digest.
+    pub base_digest: String,
+    /// Guest CPU architecture used by the snapshot.
+    pub arch: String,
+    /// Normalized toolchain expressions.
+    pub toolchains: Vec<String>,
+    /// Snapshot creation time.
+    pub created_at: DateTime<Utc>,
+    /// Most recent successful environment use.
+    pub last_used_at: DateTime<Utc>,
+    /// Best-effort logical snapshot bytes.
+    pub size_bytes: u64,
+}
+
 /// SQLite state store.
 #[derive(Debug, Clone)]
 pub struct StateStore {
@@ -148,10 +178,26 @@ impl StateStore {
                 id TEXT PRIMARY KEY NOT NULL,
                 memory_mib INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
-                active INTEGER NOT NULL DEFAULT 0
+                active INTEGER NOT NULL DEFAULT 0,
+                owner_pid INTEGER NOT NULL DEFAULT 0,
+                owner_started_at INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_reservations_expires_at
                 ON reservations(expires_at);
+            CREATE TABLE IF NOT EXISTS environments (
+                name TEXT PRIMARY KEY NOT NULL,
+                snapshot TEXT NOT NULL UNIQUE,
+                cache_key TEXT NOT NULL,
+                base TEXT NOT NULL,
+                base_digest TEXT NOT NULL,
+                arch TEXT NOT NULL,
+                toolchains_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL,
+                size_bytes INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_environments_last_used_at
+                ON environments(last_used_at);
             ",
         )?;
         let has_active = {
@@ -165,6 +211,54 @@ impl StateStore {
         if !has_active {
             connection.execute(
                 "ALTER TABLE reservations ADD COLUMN active INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let reservation_columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(reservations)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !reservation_columns
+            .iter()
+            .any(|column| column == "owner_pid")
+        {
+            connection.execute(
+                "ALTER TABLE reservations
+                 ADD COLUMN owner_pid INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !reservation_columns
+            .iter()
+            .any(|column| column == "owner_started_at")
+        {
+            connection.execute(
+                "ALTER TABLE reservations
+                 ADD COLUMN owner_started_at INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let environment_columns = {
+            let mut statement = connection.prepare("PRAGMA table_info(environments)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !environment_columns
+            .iter()
+            .any(|column| column == "base_digest")
+        {
+            connection.execute(
+                "ALTER TABLE environments
+                 ADD COLUMN base_digest TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !environment_columns.iter().any(|column| column == "arch") {
+            connection.execute(
+                "ALTER TABLE environments ADD COLUMN arch TEXT NOT NULL DEFAULT ''",
                 [],
             )?;
         }
@@ -200,13 +294,17 @@ impl StateStore {
                 maximum_mib: maximum_memory_mib,
             });
         }
+        let (owner_pid, owner_started_at) = current_process_identity();
         transaction.execute(
-            "INSERT INTO reservations (id, memory_mib, expires_at, active)
-             VALUES (?1, ?2, ?3, 0)",
+            "INSERT INTO reservations (
+                id, memory_mib, expires_at, active, owner_pid, owner_started_at
+             ) VALUES (?1, ?2, ?3, 0, ?4, ?5)",
             params![
                 record.id,
                 i64::from(record.memory_mib),
-                record.expires_at.timestamp()
+                record.expires_at.timestamp(),
+                i64::from(owner_pid),
+                i64::try_from(owner_started_at).unwrap_or(i64::MAX),
             ],
         )?;
         transaction.commit()?;
@@ -255,6 +353,49 @@ impl StateStore {
             .query_map([], decode_reservation)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(records)
+    }
+
+    /// Return non-session reservations whose creating wrapper process is gone.
+    pub fn orphaned_reservations(&self) -> Result<Vec<ReservationRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT r.id, r.memory_mib, r.expires_at, r.active,
+                    r.owner_pid, r.owner_started_at
+             FROM reservations r
+             LEFT JOIN sessions s ON s.id = r.id
+             WHERE s.id IS NULL AND r.owner_pid > 0 AND r.owner_started_at > 0
+             ORDER BY r.id ASC",
+        )?;
+        let candidates = statement
+            .query_map([], |row| {
+                let record = decode_reservation(row)?;
+                let owner_pid: i64 = row.get(4)?;
+                let owner_started_at: i64 = row.get(5)?;
+                Ok((
+                    record,
+                    u32::try_from(owner_pid).unwrap_or(0),
+                    u64::try_from(owner_started_at).unwrap_or(0),
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+        let pids = candidates
+            .iter()
+            .map(|(_, pid, _)| Pid::from_u32(*pid))
+            .collect::<Vec<_>>();
+        let mut system = System::new();
+        system.refresh_processes(ProcessesToUpdate::Some(&pids), true);
+        Ok(candidates
+            .into_iter()
+            .filter(|(_, pid, started_at)| {
+                system
+                    .process(Pid::from_u32(*pid))
+                    .is_none_or(|process| process.start_time() != *started_at)
+            })
+            .map(|(record, _, _)| record)
+            .collect())
     }
 
     /// Persist metadata for a detached session after its VM is ready.
@@ -344,6 +485,85 @@ impl StateStore {
         Ok(())
     }
 
+    /// Insert or replace one managed environment atomically.
+    pub fn upsert_environment(&self, record: &EnvironmentRecord) -> Result<()> {
+        self.connection()?.execute(
+            "INSERT INTO environments (
+                name, snapshot, cache_key, base, base_digest, arch, toolchains_json,
+                created_at, last_used_at, size_bytes
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(name) DO UPDATE SET
+                snapshot = excluded.snapshot,
+                cache_key = excluded.cache_key,
+                base = excluded.base,
+                base_digest = excluded.base_digest,
+                arch = excluded.arch,
+                toolchains_json = excluded.toolchains_json,
+                created_at = excluded.created_at,
+                last_used_at = excluded.last_used_at,
+                size_bytes = excluded.size_bytes",
+            params![
+                record.name,
+                record.snapshot,
+                record.cache_key,
+                record.base,
+                record.base_digest,
+                record.arch,
+                serde_json::to_string(&record.toolchains)?,
+                record.created_at.timestamp(),
+                record.last_used_at.timestamp(),
+                i64::try_from(record.size_bytes).unwrap_or(i64::MAX),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Return a managed environment by name.
+    pub fn get_environment(&self, name: &str) -> Result<EnvironmentRecord> {
+        self.connection()?
+            .query_row(
+                "SELECT name, snapshot, cache_key, base, base_digest, arch, toolchains_json,
+                        created_at, last_used_at, size_bytes
+                 FROM environments WHERE name = ?1",
+                [name],
+                decode_environment,
+            )
+            .optional()?
+            .ok_or_else(|| StateError::EnvironmentNotFound(name.into()))
+    }
+
+    /// List managed environments from least to most recently used.
+    pub fn list_environments(&self) -> Result<Vec<EnvironmentRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT name, snapshot, cache_key, base, base_digest, arch, toolchains_json,
+                    created_at, last_used_at, size_bytes
+             FROM environments ORDER BY last_used_at ASC, name ASC",
+        )?;
+        Ok(statement
+            .query_map([], decode_environment)?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Record a successful use for LRU pruning.
+    pub fn touch_environment(&self, name: &str, now: DateTime<Utc>) -> Result<EnvironmentRecord> {
+        let changed = self.connection()?.execute(
+            "UPDATE environments SET last_used_at = ?1 WHERE name = ?2",
+            params![now.timestamp(), name],
+        )?;
+        if changed == 0 {
+            return Err(StateError::EnvironmentNotFound(name.into()));
+        }
+        self.get_environment(name)
+    }
+
+    /// Remove a managed-environment registry entry.
+    pub fn remove_environment(&self, name: &str) -> Result<()> {
+        self.connection()?
+            .execute("DELETE FROM environments WHERE name = ?1", [name])?;
+        Ok(())
+    }
+
     /// Path to the SQLite database.
     pub fn path(&self) -> &Path {
         &self.path
@@ -397,6 +617,49 @@ fn decode_reservation(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReservationRe
             .ok_or(rusqlite::Error::IntegralValueOutOfRange(2, expires_at))?,
         active: row.get(3)?,
     })
+}
+
+fn decode_environment(row: &rusqlite::Row<'_>) -> rusqlite::Result<EnvironmentRecord> {
+    let toolchains_json: String = row.get(6)?;
+    let created_at: i64 = row.get(7)?;
+    let last_used_at: i64 = row.get(8)?;
+    let size_bytes: i64 = row.get(9)?;
+    let parse_time = |index, value| {
+        Utc.timestamp_opt(value, 0)
+            .single()
+            .ok_or(rusqlite::Error::IntegralValueOutOfRange(index, value))
+    };
+    Ok(EnvironmentRecord {
+        name: row.get(0)?,
+        snapshot: row.get(1)?,
+        cache_key: row.get(2)?,
+        base: row.get(3)?,
+        base_digest: row.get(4)?,
+        arch: row.get(5)?,
+        toolchains: serde_json::from_str(&toolchains_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                6,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        created_at: parse_time(7, created_at)?,
+        last_used_at: parse_time(8, last_used_at)?,
+        size_bytes: u64::try_from(size_bytes)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(9, size_bytes))?,
+    })
+}
+
+fn current_process_identity() -> (u32, u64) {
+    let pid = std::process::id();
+    let system_pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[system_pid]), true);
+    let started_at = system
+        .process(system_pid)
+        .map(|process| process.start_time())
+        .unwrap_or(0);
+    (pid, started_at)
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -552,5 +815,115 @@ mod tests {
             .unwrap();
         store.activate("migrated").unwrap();
         assert_eq!(store.active_reservations().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn round_trips_and_touches_managed_environments() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::open(directory.path().join("state.db")).unwrap();
+        let created_at = Utc::now() - chrono::Duration::hours(1);
+        store
+            .upsert_environment(&EnvironmentRecord {
+                name: "audit".into(),
+                snapshot: "asbx-env-audit-deadbeef".into(),
+                cache_key: "deadbeef".into(),
+                base: "ubuntu:24.04".into(),
+                base_digest: format!("sha256:{}", "a".repeat(64)),
+                arch: "aarch64".into(),
+                toolchains: vec!["go@1.24.0".into(), "rust@1.88.0".into()],
+                created_at,
+                last_used_at: created_at,
+                size_bytes: 42,
+            })
+            .unwrap();
+        let record = store.get_environment("audit").unwrap();
+        assert_eq!(record.toolchains.len(), 2);
+        let touched = store.touch_environment("audit", Utc::now()).unwrap();
+        assert!(touched.last_used_at > created_at);
+        assert_eq!(store.list_environments().unwrap().len(), 1);
+        store.remove_environment("audit").unwrap();
+        assert!(matches!(
+            store.get_environment("audit"),
+            Err(StateError::EnvironmentNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn migrates_environment_records_created_before_digest_tracking() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE environments (
+                    name TEXT PRIMARY KEY NOT NULL,
+                    snapshot TEXT NOT NULL UNIQUE,
+                    cache_key TEXT NOT NULL,
+                    base TEXT NOT NULL,
+                    toolchains_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    last_used_at INTEGER NOT NULL,
+                    size_bytes INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = StateStore::open(&path).unwrap();
+        let now = Utc::now();
+        store
+            .upsert_environment(&EnvironmentRecord {
+                name: "migrated".into(),
+                snapshot: "asbx-env-migrated".into(),
+                cache_key: "key".into(),
+                base: "ubuntu:24.04".into(),
+                base_digest: format!("sha256:{}", "b".repeat(64)),
+                arch: "x86_64".into(),
+                toolchains: vec!["node@22.0.0".into()],
+                created_at: now,
+                last_used_at: now,
+                size_bytes: 1,
+            })
+            .unwrap();
+        let migrated = store.get_environment("migrated").unwrap();
+        assert!(migrated.base_digest.starts_with("sha256:"));
+        assert_eq!(migrated.arch, "x86_64");
+    }
+
+    #[test]
+    fn detects_dead_owners_without_reclaiming_persistent_sessions() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::open(directory.path().join("state.db")).unwrap();
+        let expires_at = Utc::now() + chrono::Duration::hours(1);
+        for id in ["orphan", "persistent"] {
+            store
+                .reserve(
+                    &ReservationRecord {
+                        id: id.into(),
+                        memory_mib: 128,
+                        expires_at,
+                        active: true,
+                    },
+                    4,
+                    1024,
+                )
+                .unwrap();
+            store
+                .connection()
+                .unwrap()
+                .execute(
+                    "UPDATE reservations
+                     SET owner_pid = ?1, owner_started_at = 1 WHERE id = ?2",
+                    params![i64::from(u32::MAX), id],
+                )
+                .unwrap();
+        }
+        let mut session = record();
+        session.id = "persistent".into();
+        store.insert(&session).unwrap();
+
+        let orphaned = store.orphaned_reservations().unwrap();
+        assert_eq!(orphaned.len(), 1);
+        assert_eq!(orphaned[0].id, "orphan");
     }
 }

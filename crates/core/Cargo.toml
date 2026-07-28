@@ -9,6 +9,7 @@ license.workspace = true
 path = "lib/lib.rs"
 
 [dependencies]
+agent-sandbox-cache.workspace = true
 agent-sandbox-detector.workspace = true
 agent-sandbox-environment.workspace = true
 agent-sandbox-policy.workspace = true
@@ -19,6 +20,7 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]

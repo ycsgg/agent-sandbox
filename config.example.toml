@@ -8,12 +8,14 @@ max_ttl = "8h"
 [workspace]
 roots = []
 allow_rw_mount = false
+rw_mount_quota = "2G"
 
 [network]
 default = "public"
 allow_all_mode = false
 allow_private_override = false
 allow_non_loopback_publish = false
+max_custom_rules = 64
 
 [resources]
 default_cpus = 2
@@ -32,3 +34,6 @@ max_artifact_total = "2G"
 max_files = 100000
 max_file_size = "1G"
 max_total_size = "8G"
+
+[cache]
+max_size = "50G"

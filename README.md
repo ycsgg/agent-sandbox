@@ -12,6 +12,11 @@ Copy mode respects project `.gitignore` and `.agent-sandbox-ignore` files,
 rejects escaping symlinks, and constructs guest paths with POSIX semantics on
 Linux, macOS, and Windows hosts.
 
+Authorized projects can instead be mounted read-only or, behind an explicit
+host gate and write quota, read-write. Network policies support offline,
+public-only, statically inferred dependency registries, and deny-by-default
+domain/CIDR/port rules.
+
 ## Build
 
 The repository pins the published Microsandbox Rust SDK at v0.6.7. A local
@@ -38,20 +43,28 @@ cargo run -p agent-sandbox-cli -- doctor
 ```bash
 asbx env detect --project . --json
 asbx run --project . --env auto -- cargo test --workspace
+asbx run --project . --project-mode mount-ro --network dependencies -- cargo fetch
+
+asbx env create audit-full --base ubuntu:24.04 \
+  --toolchain go@1.24 --toolchain rust@1.88 --toolchain node@22
+asbx run --project . --env audit-full -- ./scripts/verify.sh
 
 id="$(asbx open --project . --env node@22)"
 asbx exec "$id" -- npm ci
 asbx exec "$id" -- npm test
 asbx close "$id"
+
+asbx cache status --json
+asbx cache prune --max-size 20G --dry-run --json
 ```
 
 See [`skill/agent-sandbox/SKILL.md`](skill/agent-sandbox/SKILL.md) and
 [`agent-sandbox.md`](agent-sandbox.md) for workflows and design rationale.
 
-## Current scope
+## Safety notes
 
-The implemented CLI covers the Phase 1 execution loop plus environment
-detection, JSON/JSONL output, loopback publishing, artifacts, and lease
-reconciliation. Workspace mounts, custom network rules, multi-toolchain
-environment building, and cache pruning remain later-phase features and are
-not exposed as working commands.
+`mount-rw` lets guest code modify the authorized host project and is disabled
+unless `workspace.allow_rw_mount` is enabled. Named environments contain only
+trusted wrapper provisioning, never project install hooks. Cache pruning keeps
+named environments by default; use `--include-environments` explicitly and
+review `--dry-run` output before removing them.

@@ -9,7 +9,11 @@ use std::{
     time::Duration,
 };
 
-use agent_sandbox_runtime::{NetworkMode, PortMapping, RootSource, SecurityMode};
+use agent_sandbox_runtime::{
+    NetworkMode, NetworkRule, NetworkRuleAction, NetworkRuleTarget, PortMapping, ProjectMode,
+    RootSource, SecurityMode,
+};
+use ipnet::IpNet;
 use serde::Deserialize;
 
 //--------------------------------------------------------------------------------------------------
@@ -92,6 +96,8 @@ pub struct HostConfig {
     pub output: OutputConfig,
     /// Project-transfer limits.
     pub transfer: TransferConfig,
+    /// Wrapper-managed cache quota.
+    pub cache: CacheConfig,
 }
 
 /// Runtime host settings.
@@ -111,13 +117,15 @@ pub struct RuntimeConfig {
 }
 
 /// Workspace boundary settings.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkspaceConfig {
     /// Canonical roots under which projects may be copied or mounted.
     pub roots: Vec<PathBuf>,
     /// Whether writable mounts may be explicitly requested.
     pub allow_rw_mount: bool,
+    /// Maximum guest growth allowed through one writable project mount.
+    pub rw_mount_quota: String,
 }
 
 /// Network gates.
@@ -132,6 +140,8 @@ pub struct NetworkConfig {
     pub allow_private_override: bool,
     /// Whether published ports may bind non-loopback addresses.
     pub allow_non_loopback_publish: bool,
+    /// Maximum number of custom egress rules.
+    pub max_custom_rules: usize,
 }
 
 /// Resource defaults and caps.
@@ -176,6 +186,14 @@ pub struct TransferConfig {
     pub max_total_size: String,
 }
 
+/// Cache quota defaults.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Maximum logical bytes retained by default.
+    pub max_size: String,
+}
+
 /// User-selectable sandbox settings before policy enforcement.
 #[derive(Debug, Clone)]
 pub struct RequestedSpec {
@@ -195,6 +213,10 @@ pub struct RequestedSpec {
     pub security: SecurityMode,
     /// Network mode, or host default.
     pub network: Option<NetworkMode>,
+    /// Ordered custom or dependency egress rules.
+    pub network_rules: Vec<NetworkRule>,
+    /// Project copy or mount mode.
+    pub project_mode: ProjectMode,
     /// Command timeout, or none.
     pub timeout: Option<Duration>,
     /// Session TTL, or host default.
@@ -224,6 +246,12 @@ pub struct EffectiveSpec {
     pub security: SecurityMode,
     /// Effective network mode.
     pub network: NetworkMode,
+    /// Policy-approved custom/dependency egress rules.
+    pub network_rules: Vec<NetworkRule>,
+    /// Effective project exposure mode.
+    pub project_mode: ProjectMode,
+    /// Guest growth quota for a writable project mount.
+    pub rw_mount_quota_mib: Option<u32>,
     /// Effective command timeout.
     pub timeout: Option<Duration>,
     /// Effective session TTL.
@@ -278,6 +306,17 @@ impl Default for NetworkConfig {
             allow_all_mode: false,
             allow_private_override: false,
             allow_non_loopback_publish: false,
+            max_custom_rules: 64,
+        }
+    }
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            allow_rw_mount: false,
+            rw_mount_quota: "2G".into(),
         }
     }
 }
@@ -311,6 +350,14 @@ impl Default for TransferConfig {
             max_files: 100_000,
             max_file_size: "1G".into(),
             max_total_size: "8G".into(),
+        }
+    }
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            max_size: "50G".into(),
         }
     }
 }
@@ -414,6 +461,27 @@ impl HostConfig {
                 "network mode 'all' is disabled by host configuration".into(),
             ));
         }
+        let network_rules = self.validate_network_rules(network, requested.network_rules)?;
+
+        let rw_mount_quota_mib = match requested.project_mode {
+            ProjectMode::Copy | ProjectMode::MountReadOnly => None,
+            ProjectMode::MountReadWrite => {
+                if !self.workspace.allow_rw_mount {
+                    return Err(PolicyError::Forbidden(
+                        "project mode 'mount-rw' is disabled by host configuration".into(),
+                    ));
+                }
+                let quota = parse_size_mib(&self.workspace.rw_mount_quota, "rw_mount_quota")?;
+                if quota == 0 {
+                    return Err(PolicyError::InvalidValue {
+                        field: "rw_mount_quota",
+                        value: self.workspace.rw_mount_quota.clone(),
+                        reason: "must be greater than zero".into(),
+                    });
+                }
+                Some(quota)
+            }
+        };
 
         let default_ttl = parse_duration(&self.runtime.default_ttl)?;
         let max_ttl = parse_duration(&self.runtime.max_ttl)?;
@@ -445,6 +513,9 @@ impl HostConfig {
             user: requested.user,
             security: requested.security,
             network,
+            network_rules,
+            project_mode: requested.project_mode,
+            rw_mount_quota_mib,
             timeout: requested.timeout,
             ttl,
             max_ttl,
@@ -485,6 +556,43 @@ impl HostConfig {
                 .collect::<Vec<_>>()
                 .join(", "),
         })
+    }
+
+    fn validate_network_rules(
+        &self,
+        mode: NetworkMode,
+        mut rules: Vec<NetworkRule>,
+    ) -> Result<Vec<NetworkRule>> {
+        if rules.len() > self.network.max_custom_rules {
+            return Err(PolicyError::LimitExceeded {
+                field: "network rule count",
+                requested: rules.len().to_string(),
+                maximum: self.network.max_custom_rules.to_string(),
+            });
+        }
+        if !matches!(mode, NetworkMode::Rules | NetworkMode::Dependencies) && !rules.is_empty() {
+            return Err(PolicyError::InvalidValue {
+                field: "network rules",
+                value: format!("{} rule(s)", rules.len()),
+                reason: "rules require --network rules or --network dependencies".into(),
+            });
+        }
+        if mode == NetworkMode::Rules && rules.is_empty() {
+            return Err(PolicyError::InvalidValue {
+                field: "network rules",
+                value: "empty".into(),
+                reason: "--network rules requires at least one allow or deny rule".into(),
+            });
+        }
+        for rule in &mut rules {
+            validate_network_rule(rule, self.network.allow_private_override)?;
+            normalize_network_rule(rule);
+        }
+        rules.sort_by_key(|rule| match rule.action {
+            NetworkRuleAction::Deny => 0_u8,
+            NetworkRuleAction::Allow => 1,
+        });
+        Ok(rules)
     }
 }
 
@@ -573,13 +681,124 @@ fn parse_network(value: &str) -> Result<NetworkMode> {
     match value {
         "off" => Ok(NetworkMode::Off),
         "public" => Ok(NetworkMode::Public),
+        "dependencies" => Ok(NetworkMode::Dependencies),
+        "rules" => Ok(NetworkMode::Rules),
         "all" => Ok(NetworkMode::All),
         _ => Err(PolicyError::InvalidValue {
             field: "network.default",
             value: value.into(),
-            reason: "expected off, public, or all".into(),
+            reason: "expected off, public, dependencies, rules, or all".into(),
         }),
     }
+}
+
+fn validate_network_rule(rule: &NetworkRule, allow_private_override: bool) -> Result<()> {
+    match &rule.target {
+        NetworkRuleTarget::Domain(value) | NetworkRuleTarget::DomainSuffix(value) => {
+            validate_domain(value)?;
+        }
+        NetworkRuleTarget::Cidr(value) => {
+            let network = value
+                .parse::<IpNet>()
+                .map_err(|error| PolicyError::InvalidValue {
+                    field: "network CIDR",
+                    value: value.clone(),
+                    reason: error.to_string(),
+                })?;
+            if rule.action == NetworkRuleAction::Allow
+                && !allow_private_override
+                && overlaps_protected_network(network)
+            {
+                return Err(PolicyError::Forbidden(format!(
+                    "allowing protected/private CIDR {value:?} requires network.allow_private_override = true"
+                )));
+            }
+        }
+        NetworkRuleTarget::PublicPort { start, end } => {
+            if *start == 0 || start > end {
+                return Err(PolicyError::InvalidValue {
+                    field: "network port",
+                    value: format!("{start}-{end}"),
+                    reason: "ports must be an ascending range between 1 and 65535".into(),
+                });
+            }
+        }
+        NetworkRuleTarget::Private | NetworkRuleTarget::Host | NetworkRuleTarget::Metadata
+            if rule.action == NetworkRuleAction::Allow && !allow_private_override =>
+        {
+            return Err(PolicyError::Forbidden(
+                "allowing private, host, or metadata destinations requires network.allow_private_override = true"
+                    .into(),
+            ));
+        }
+        NetworkRuleTarget::Private | NetworkRuleTarget::Host | NetworkRuleTarget::Metadata => {}
+    }
+    Ok(())
+}
+
+fn normalize_network_rule(rule: &mut NetworkRule) {
+    match &mut rule.target {
+        NetworkRuleTarget::Domain(value) | NetworkRuleTarget::DomainSuffix(value) => {
+            *value = value.trim_matches('.').to_ascii_lowercase();
+        }
+        NetworkRuleTarget::Cidr(value) => {
+            *value = value
+                .parse::<IpNet>()
+                .expect("CIDR was validated before normalization")
+                .to_string();
+        }
+        NetworkRuleTarget::PublicPort { .. }
+        | NetworkRuleTarget::Private
+        | NetworkRuleTarget::Host
+        | NetworkRuleTarget::Metadata => {}
+    }
+}
+
+fn validate_domain(value: &str) -> Result<()> {
+    let value = value.trim_matches('.');
+    let valid = !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    if !valid {
+        return Err(PolicyError::InvalidValue {
+            field: "network domain",
+            value: value.into(),
+            reason: "expected an ASCII DNS name without wildcards".into(),
+        });
+    }
+    Ok(())
+}
+
+fn overlaps_protected_network(network: IpNet) -> bool {
+    const PROTECTED: &[&str] = &[
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/4",
+        "::/128",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8",
+    ];
+    PROTECTED.iter().any(|protected| {
+        let protected = protected
+            .parse::<IpNet>()
+            .expect("hard-coded protected CIDR is valid");
+        network.contains(&protected.network()) || protected.contains(&network.network())
+    })
 }
 
 fn enforce_limit(field: &'static str, requested: u32, maximum: u32) -> Result<()> {
@@ -647,7 +866,75 @@ mod tests {
         let root = tempdir().unwrap();
         let project = root.path().join("project");
         fs::create_dir(&project).unwrap();
-        let request = RequestedSpec {
+        let request = request(project);
+        assert!(HostConfig::default().enforce(request, root.path()).is_ok());
+    }
+
+    #[test]
+    fn writable_mount_requires_explicit_host_gate_and_gets_a_quota() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut requested = request(project.clone());
+        requested.project_mode = ProjectMode::MountReadWrite;
+        assert!(matches!(
+            HostConfig::default().enforce(requested.clone(), root.path()),
+            Err(PolicyError::Forbidden(_))
+        ));
+
+        let mut config = HostConfig::default();
+        config.workspace.allow_rw_mount = true;
+        config.workspace.rw_mount_quota = "512M".into();
+        let effective = config.enforce(requested, root.path()).unwrap();
+        assert_eq!(effective.rw_mount_quota_mib, Some(512));
+    }
+
+    #[test]
+    fn network_denies_are_ordered_before_allows() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut requested = request(project);
+        requested.network = Some(NetworkMode::Rules);
+        requested.network_rules = vec![
+            NetworkRule {
+                action: NetworkRuleAction::Allow,
+                target: NetworkRuleTarget::DomainSuffix(".EXAMPLE.COM.".into()),
+            },
+            NetworkRule {
+                action: NetworkRuleAction::Deny,
+                target: NetworkRuleTarget::Domain("blocked.example.com".into()),
+            },
+        ];
+        let effective = HostConfig::default()
+            .enforce(requested, root.path())
+            .unwrap();
+        assert_eq!(effective.network_rules[0].action, NetworkRuleAction::Deny);
+        assert_eq!(
+            effective.network_rules[1].target,
+            NetworkRuleTarget::DomainSuffix("example.com".into())
+        );
+    }
+
+    #[test]
+    fn protected_cidr_requires_explicit_host_gate() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut requested = request(project);
+        requested.network = Some(NetworkMode::Rules);
+        requested.network_rules.push(NetworkRule {
+            action: NetworkRuleAction::Allow,
+            target: NetworkRuleTarget::Cidr("169.254.169.254/32".into()),
+        });
+        assert!(matches!(
+            HostConfig::default().enforce(requested, root.path()),
+            Err(PolicyError::Forbidden(_))
+        ));
+    }
+
+    fn request(project: PathBuf) -> RequestedSpec {
+        RequestedSpec {
             root: RootSource::Image("alpine".into()),
             project,
             cpus: None,
@@ -656,11 +943,12 @@ mod tests {
             user: None,
             security: SecurityMode::Default,
             network: None,
+            network_rules: vec![],
+            project_mode: ProjectMode::Copy,
             timeout: None,
             ttl: None,
             env: vec![],
             ports: vec![],
-        };
-        assert!(HostConfig::default().enforce(request, root.path()).is_ok());
+        }
     }
 }

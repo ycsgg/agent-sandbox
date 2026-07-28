@@ -2,18 +2,27 @@
 
 #![forbid(unsafe_code)]
 
-use std::{collections::HashMap, path::Path, sync::Mutex, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Mutex,
+    time::Duration,
+};
 
 use agent_sandbox_runtime::{
-    CreateSpec, ExecEvent, ExecRequest, ExecStream, GuestEntry, NetworkMode, OutputStream, Result,
-    RootSource, RuntimeError, SandboxInfo, SandboxRuntime, SecurityMode,
+    CreateSpec, ExecEvent, ExecRequest, ExecStream, GuestEntry, ImageInfo, NetworkMode,
+    NetworkRule, NetworkRuleAction, NetworkRuleTarget, OutputStream, Result, RootSource,
+    RuntimeError, SandboxInfo, SandboxRuntime, SecurityMode, SnapshotInfo, WorkspaceSpec,
 };
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use ipnet::IpNet;
 use microsandbox::{
-    ExecEvent as MsbExecEvent, Sandbox,
+    ExecEvent as MsbExecEvent, Sandbox, Snapshot,
     sandbox::{FsEntryKind, FsSetAttrs, NetworkPolicy, NetworkProfile, SecurityProfile},
     setup::CheckState,
 };
+use microsandbox_network::policy::NetworkPolicyBuilder;
 use tokio::sync::mpsc;
 
 //--------------------------------------------------------------------------------------------------
@@ -54,10 +63,33 @@ impl SandboxRuntime for MicrosandboxRuntime {
             NetworkMode::Public => builder.network(|network| {
                 network.policy(NetworkPolicy::from_profiles([NetworkProfile::Public]))
             }),
+            NetworkMode::Dependencies | NetworkMode::Rules => {
+                let policy = build_custom_network_policy(&spec.network_rules)?;
+                builder.network(|network| network.policy(policy))
+            }
             NetworkMode::All => {
                 builder.network(|network| network.policy(NetworkPolicy::allow_all()))
             }
         };
+        if let WorkspaceSpec::Mount {
+            host,
+            read_only,
+            write_quota_mib,
+        } = &spec.workspace
+        {
+            let host = host.clone();
+            let read_only = *read_only;
+            let write_quota_mib = *write_quota_mib;
+            builder = builder.volume("/workspace", move |mount| {
+                let mut mount = mount.bind(host).nodev().nosuid();
+                if read_only {
+                    mount = mount.readonly();
+                } else if let Some(quota_mib) = write_quota_mib {
+                    mount = mount.quota(quota_mib);
+                }
+                mount
+            });
+        }
         if let Some(user) = &spec.user {
             builder = builder.user(user);
         }
@@ -460,6 +492,76 @@ impl SandboxRuntime for MicrosandboxRuntime {
         }
         Ok(checks)
     }
+
+    async fn create_snapshot(
+        &self,
+        name: &str,
+        sandbox: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<SnapshotInfo> {
+        let mut builder = Snapshot::builder(name).from_sandbox(sandbox);
+        for (key, value) in labels {
+            builder = builder.label(key, value);
+        }
+        let snapshot = builder
+            .create()
+            .await
+            .map_err(|error| backend("create environment snapshot", error))?;
+        Ok(snapshot_info(name, &snapshot))
+    }
+
+    async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
+        let handles = Snapshot::list()
+            .await
+            .map_err(|error| backend("list snapshots", error))?;
+        let mut snapshots = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let name = handle.name().unwrap_or(handle.digest()).to_owned();
+            let snapshot = handle
+                .open()
+                .await
+                .map_err(|error| backend("open snapshot metadata", error))?;
+            snapshots.push(snapshot_info(&name, &snapshot));
+        }
+        Ok(snapshots)
+    }
+
+    async fn inspect_snapshot(&self, name: &str) -> Result<SnapshotInfo> {
+        let snapshot = Snapshot::open(name)
+            .await
+            .map_err(|error| backend("inspect snapshot", error))?;
+        Ok(snapshot_info(name, &snapshot))
+    }
+
+    async fn remove_snapshot(&self, name: &str) -> Result<()> {
+        Snapshot::remove(name, false)
+            .await
+            .map_err(|error| backend("remove snapshot", error))
+    }
+
+    async fn list_images(&self) -> Result<Vec<ImageInfo>> {
+        Ok(microsandbox::image::Image::list()
+            .await
+            .map_err(|error| backend("list cached images", error))?
+            .into_iter()
+            .map(|image| ImageInfo {
+                reference: image.reference().to_owned(),
+                manifest_digest: image.manifest_digest().map(str::to_owned),
+                size_bytes: image
+                    .size_bytes()
+                    .and_then(|size| u64::try_from(size).ok())
+                    .unwrap_or(0),
+                last_used_at: image.last_used_at(),
+                created_at: image.created_at(),
+            })
+            .collect())
+    }
+
+    async fn remove_image(&self, reference: &str) -> Result<()> {
+        microsandbox::image::Image::remove(reference, false)
+            .await
+            .map_err(|error| backend("remove cached image", error))
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -505,6 +607,170 @@ fn try_report_drop(
         }
         Err(mpsc::error::TrySendError::Full(_)) => true,
         Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
+fn build_custom_network_policy(rules: &[NetworkRule]) -> Result<NetworkPolicy> {
+    let allowances = protected_allowances(rules);
+    let mut builder = NetworkPolicy::builder()
+        .default_deny()
+        .egress(|rule| rule.tcp().udp().port(53).allow_host())
+        .egress(|rule| {
+            if !allowances.private {
+                rule.deny_private();
+            }
+            if !allowances.host {
+                rule.deny_host();
+            }
+            if !allowances.metadata {
+                rule.deny_meta();
+            }
+            if !allowances.loopback {
+                rule.deny_loopback();
+            }
+            if !allowances.link_local {
+                rule.deny_link_local();
+            }
+            if !allowances.multicast {
+                rule.deny_multicast();
+            }
+            rule
+        })
+        .ingress(|rule| rule.allow().any());
+    for rule in rules {
+        builder = add_network_rule(builder, rule);
+    }
+    builder.build().map_err(|error| RuntimeError::Backend {
+        operation: "build network policy",
+        message: error.to_string(),
+    })
+}
+
+#[derive(Debug, Default)]
+struct ProtectedAllowances {
+    private: bool,
+    host: bool,
+    metadata: bool,
+    loopback: bool,
+    link_local: bool,
+    multicast: bool,
+}
+
+fn protected_allowances(rules: &[NetworkRule]) -> ProtectedAllowances {
+    let mut result = ProtectedAllowances::default();
+    for rule in rules {
+        if rule.action != NetworkRuleAction::Allow {
+            continue;
+        }
+        match &rule.target {
+            NetworkRuleTarget::Private => result.private = true,
+            NetworkRuleTarget::Host => result.host = true,
+            NetworkRuleTarget::Metadata => {
+                result.metadata = true;
+                result.link_local = true;
+            }
+            NetworkRuleTarget::Cidr(value) => {
+                let Ok(network) = value.parse::<IpNet>() else {
+                    continue;
+                };
+                result.private |= overlaps_any(
+                    network,
+                    &[
+                        "10.0.0.0/8",
+                        "100.64.0.0/10",
+                        "172.16.0.0/12",
+                        "192.168.0.0/16",
+                        "fc00::/7",
+                    ],
+                );
+                result.loopback |= overlaps_any(network, &["127.0.0.0/8", "::1/128"]);
+                result.link_local |= overlaps_any(network, &["169.254.0.0/16", "fe80::/10"]);
+                result.metadata |=
+                    overlaps_any(network, &["169.254.169.254/32", "fd00:ec2::254/128"]);
+                result.multicast |= overlaps_any(network, &["224.0.0.0/4", "ff00::/8"]);
+            }
+            NetworkRuleTarget::Domain(_)
+            | NetworkRuleTarget::DomainSuffix(_)
+            | NetworkRuleTarget::PublicPort { .. } => {}
+        }
+    }
+    result
+}
+
+fn overlaps_any(network: IpNet, protected: &[&str]) -> bool {
+    protected.iter().any(|protected| {
+        let protected = protected
+            .parse::<IpNet>()
+            .expect("hard-coded protected network is valid");
+        network.contains(&protected.network()) || protected.contains(&network.network())
+    })
+}
+
+fn add_network_rule(builder: NetworkPolicyBuilder, rule: &NetworkRule) -> NetworkPolicyBuilder {
+    builder.egress(|builder| {
+        match (&rule.action, &rule.target) {
+            (NetworkRuleAction::Allow, NetworkRuleTarget::Domain(value)) => {
+                builder.allow().domain(value);
+            }
+            (NetworkRuleAction::Deny, NetworkRuleTarget::Domain(value)) => {
+                builder.deny().domain(value);
+            }
+            (NetworkRuleAction::Allow, NetworkRuleTarget::DomainSuffix(value)) => {
+                builder.allow().domain_suffix(value);
+            }
+            (NetworkRuleAction::Deny, NetworkRuleTarget::DomainSuffix(value)) => {
+                builder.deny().domain_suffix(value);
+            }
+            (NetworkRuleAction::Allow, NetworkRuleTarget::Cidr(value)) => {
+                builder.allow().cidr(value);
+            }
+            (NetworkRuleAction::Deny, NetworkRuleTarget::Cidr(value)) => {
+                builder.deny().cidr(value);
+            }
+            (action, NetworkRuleTarget::PublicPort { start, end }) => {
+                builder.tcp().udp().port_range(*start, *end);
+                match action {
+                    NetworkRuleAction::Allow => {
+                        builder.allow_public();
+                    }
+                    NetworkRuleAction::Deny => {
+                        builder.deny_public();
+                    }
+                }
+            }
+            (NetworkRuleAction::Allow, NetworkRuleTarget::Private) => {
+                builder.allow_private();
+            }
+            (NetworkRuleAction::Deny, NetworkRuleTarget::Private) => {
+                builder.deny_private();
+            }
+            (NetworkRuleAction::Allow, NetworkRuleTarget::Host) => {
+                builder.allow_host();
+            }
+            (NetworkRuleAction::Deny, NetworkRuleTarget::Host) => {
+                builder.deny_host();
+            }
+            (NetworkRuleAction::Allow, NetworkRuleTarget::Metadata) => {
+                builder.allow_meta();
+            }
+            (NetworkRuleAction::Deny, NetworkRuleTarget::Metadata) => {
+                builder.deny_meta();
+            }
+        }
+        builder
+    })
+}
+
+fn snapshot_info(name: &str, snapshot: &Snapshot) -> SnapshotInfo {
+    let manifest = snapshot.manifest();
+    SnapshotInfo {
+        name: name.to_owned(),
+        digest: snapshot.digest().to_owned(),
+        image: manifest.image.reference.clone(),
+        image_manifest_digest: manifest.image.manifest_digest.clone(),
+        size_bytes: snapshot.size_bytes().unwrap_or(0),
+        created_at: manifest.created_at.parse::<DateTime<Utc>>().ok(),
+        labels: manifest.labels.clone(),
     }
 }
 
@@ -589,7 +855,9 @@ async fn send_final_drop_notices(
 
 fn backend(operation: &'static str, error: microsandbox::MicrosandboxError) -> RuntimeError {
     match error {
-        microsandbox::MicrosandboxError::SandboxNotFound(name) => RuntimeError::NotFound(name),
+        microsandbox::MicrosandboxError::SandboxNotFound(name)
+        | microsandbox::MicrosandboxError::SnapshotNotFound(name)
+        | microsandbox::MicrosandboxError::ImageNotFound(name) => RuntimeError::NotFound(name),
         error => RuntimeError::Backend {
             operation,
             message: error.to_string(),
@@ -630,5 +898,36 @@ mod tests {
                 dropped_bytes: 4096,
             }
         ));
+    }
+
+    #[test]
+    fn domain_rules_do_not_relax_protected_address_groups() {
+        let allowances = protected_allowances(&[NetworkRule {
+            action: NetworkRuleAction::Allow,
+            target: NetworkRuleTarget::DomainSuffix("example.com".into()),
+        }]);
+        assert!(!allowances.private);
+        assert!(!allowances.host);
+        assert!(!allowances.metadata);
+        assert!(!allowances.loopback);
+        assert!(!allowances.link_local);
+        build_custom_network_policy(&[NetworkRule {
+            action: NetworkRuleAction::Allow,
+            target: NetworkRuleTarget::Domain("example.com".into()),
+        }])
+        .unwrap();
+    }
+
+    #[test]
+    fn approved_protected_cidr_relaxes_only_overlapping_groups() {
+        let allowances = protected_allowances(&[NetworkRule {
+            action: NetworkRuleAction::Allow,
+            target: NetworkRuleTarget::Cidr("10.20.0.0/16".into()),
+        }]);
+        assert!(allowances.private);
+        assert!(!allowances.host);
+        assert!(!allowances.metadata);
+        assert!(!allowances.loopback);
+        assert!(!allowances.link_local);
     }
 }

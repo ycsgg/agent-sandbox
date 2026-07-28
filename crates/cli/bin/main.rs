@@ -10,10 +10,16 @@ use std::{
     time::Duration,
 };
 
-use agent_sandbox_core::{AgentSandbox, RequestedPort, SandboxOptions};
+use agent_sandbox_core::{
+    AgentSandbox, CachePruneOptions, EnvironmentBuildOptions, PreparedEnvironment, RequestedPort,
+    SandboxOptions,
+};
 use agent_sandbox_exec::{ExecSummary, OutputFormat, forward};
 use agent_sandbox_policy::{HostConfig, parse_duration};
-use agent_sandbox_runtime::{ExecRequest, NetworkMode, SecurityMode};
+use agent_sandbox_runtime::{
+    ExecRequest, NetworkMode, NetworkRule, NetworkRuleAction, NetworkRuleTarget, ProjectMode,
+    SecurityMode,
+};
 use agent_sandbox_runtime_msb::MicrosandboxRuntime;
 use agent_sandbox_state::StateStore;
 use anyhow::{Context, Result, bail};
@@ -103,12 +109,12 @@ enum Command {
         #[command(subcommand)]
         command: ArtifactCommand,
     },
-    /// Detect project runtime declarations.
+    /// Detect, build, inspect, and remove reusable environments.
     Env {
         #[command(subcommand)]
         command: EnvCommand,
     },
-    /// Inspect wrapper state/cache disk usage.
+    /// Inspect and prune wrapper-managed runtime caches.
     Cache {
         #[command(subcommand)]
         command: CacheCommand,
@@ -138,10 +144,10 @@ struct OpenArgs {
 
 #[derive(Debug, Args)]
 struct CommonSandboxArgs {
-    /// Project directory to copy into `/workspace`.
+    /// Project directory to copy or mount at `/workspace`.
     #[arg(long, default_value = ".")]
     project: PathBuf,
-    /// Project transfer mode. Phase 1 safely supports copy mode.
+    /// Project exposure mode. Writable mounts require explicit host policy.
     #[arg(long, default_value = "copy")]
     project_mode: ProjectModeArg,
     /// Detect the environment, use `LANG@VERSION`, or select a named environment.
@@ -171,6 +177,39 @@ struct CommonSandboxArgs {
     /// Guest network policy.
     #[arg(long)]
     network: Option<NetworkArg>,
+    /// Allow one exact domain in `--network rules` mode.
+    #[arg(long = "allow-domain")]
+    allow_domains: Vec<String>,
+    /// Deny one exact domain in `--network rules` mode.
+    #[arg(long = "deny-domain")]
+    deny_domains: Vec<String>,
+    /// Allow an apex domain and all subdomains.
+    #[arg(long = "allow-domain-suffix")]
+    allow_domain_suffixes: Vec<String>,
+    /// Deny an apex domain and all subdomains.
+    #[arg(long = "deny-domain-suffix")]
+    deny_domain_suffixes: Vec<String>,
+    /// Allow an IP address or CIDR.
+    #[arg(long = "allow-cidr")]
+    allow_cidrs: Vec<String>,
+    /// Deny an IP address or CIDR.
+    #[arg(long = "deny-cidr")]
+    deny_cidrs: Vec<String>,
+    /// Allow a public destination port or inclusive port range.
+    #[arg(long = "allow-port", value_parser = port_range_value)]
+    allow_ports: Vec<(u16, u16)>,
+    /// Deny a public destination port or inclusive port range.
+    #[arg(long = "deny-port", value_parser = port_range_value)]
+    deny_ports: Vec<(u16, u16)>,
+    /// Allow private address ranges. Requires a host-policy override.
+    #[arg(long)]
+    allow_private: bool,
+    /// Allow the host gateway. Requires a host-policy override.
+    #[arg(long)]
+    allow_host: bool,
+    /// Allow cloud metadata endpoints. Requires a host-policy override.
+    #[arg(long)]
+    allow_metadata: bool,
     /// Per-command timeout.
     #[arg(long, value_parser = duration_value)]
     timeout: Option<Duration>,
@@ -257,12 +296,78 @@ enum EnvCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Build and snapshot a reusable multi-toolchain environment.
+    Create(EnvCreateArgs),
+    /// List managed environments by least-recent use.
+    List {
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one managed environment and verify its snapshot exists.
+    Inspect {
+        /// Managed environment name.
+        name: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove one managed environment and its snapshot.
+    Remove {
+        /// Managed environment name.
+        name: String,
+    },
+}
+
+#[derive(Debug, Args)]
+struct EnvCreateArgs {
+    /// Managed environment name.
+    name: String,
+    /// Base OCI image.
+    #[arg(long, default_value = "ubuntu:24.04")]
+    base: String,
+    /// Toolchain expression such as go@1.24, rust@1.88, or node@22.
+    #[arg(long, required = true)]
+    toolchain: Vec<String>,
+    /// Builder virtual CPUs.
+    #[arg(long)]
+    cpus: Option<u8>,
+    /// Builder memory, for example 4G.
+    #[arg(long)]
+    memory: Option<String>,
+    /// Builder writable root disk, for example 16G.
+    #[arg(long)]
+    disk: Option<String>,
+    /// Replace an existing name or rebuild an identical snapshot.
+    #[arg(long)]
+    force: bool,
+    /// Builder output format.
+    #[arg(long, default_value = "text")]
+    output: OutputArg,
 }
 
 #[derive(Debug, Subcommand)]
 enum CacheCommand {
-    /// Show wrapper state directory disk usage.
+    /// Show wrapper state plus runtime image and environment usage.
     Status {
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove expired and least-recently-used cache objects.
+    Prune {
+        /// Logical cache target; defaults to host cache.max_size.
+        #[arg(long)]
+        max_size: Option<String>,
+        /// Also remove objects unused for at least this duration.
+        #[arg(long, value_parser = duration_value)]
+        older_than: Option<Duration>,
+        /// Permit pruning named environment snapshots.
+        #[arg(long)]
+        include_environments: bool,
+        /// Print the deterministic plan without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -280,6 +385,8 @@ enum ProjectModeArg {
 enum NetworkArg {
     Off,
     Public,
+    Dependencies,
+    Rules,
     All,
 }
 
@@ -507,24 +614,243 @@ async fn run(cli: Cli) -> Result<i32> {
                 }
                 Ok(0)
             }
+            EnvCommand::Create(arguments) => create_environment(&service, arguments).await,
+            EnvCommand::List { json } => {
+                let environments = service.list_environments()?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&environments)?);
+                } else if environments.is_empty() {
+                    println!("no managed environments");
+                } else {
+                    for environment in environments {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            environment.name,
+                            environment.snapshot,
+                            environment.last_used_at.to_rfc3339(),
+                            environment.toolchains.join(",")
+                        );
+                    }
+                }
+                Ok(0)
+            }
+            EnvCommand::Inspect { name, json } => {
+                let environment = service.inspect_environment(&name).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&environment)?);
+                } else {
+                    println!("name: {}", environment.name);
+                    println!("snapshot: {}", environment.snapshot);
+                    println!("base: {}", environment.base);
+                    println!("toolchains: {}", environment.toolchains.join(", "));
+                    println!("cache key: {}", environment.cache_key);
+                    println!("size: {}", environment.size_bytes);
+                    println!("last used: {}", environment.last_used_at.to_rfc3339());
+                }
+                Ok(0)
+            }
+            EnvCommand::Remove { name } => {
+                service.remove_environment(&name).await?;
+                println!("{name}");
+                Ok(0)
+            }
         },
         Command::Cache { command } => match command {
             CacheCommand::Status { json } => {
                 let directory = state_path.parent().unwrap_or(Path::new("."));
                 let status = agent_sandbox_cache::status(directory)?;
+                let inventory = service.cache_inventory().await?;
                 if json {
                     println!(
                         "{}",
-                        serde_json::json!({"path": directory, "files": status.files, "bytes": status.bytes})
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "state": {
+                                "path": directory,
+                                "files": status.files,
+                                "bytes": status.bytes,
+                            },
+                            "runtime": inventory,
+                        }))?
                     );
                 } else {
-                    println!("path: {}", directory.display());
-                    println!("files: {}", status.files);
-                    println!("bytes: {}", status.bytes);
+                    println!("state path: {}", directory.display());
+                    println!("state files: {}", status.files);
+                    println!("state bytes: {}", status.bytes);
+                    println!("images: {}", inventory.images.len());
+                    println!("environments: {}", inventory.environments.len());
+                    println!("runtime logical bytes: {}", inventory.logical_bytes);
                 }
                 Ok(0)
             }
+            CacheCommand::Prune {
+                max_size,
+                older_than,
+                include_environments,
+                dry_run,
+                json,
+            } => {
+                let maximum = max_size
+                    .as_deref()
+                    .unwrap_or(&service.config().cache.max_size);
+                let maximum_bytes = agent_sandbox_policy::parse_bytes(maximum, "cache max_size")?;
+                let report = service
+                    .prune_cache(CachePruneOptions {
+                        maximum_bytes,
+                        older_than,
+                        include_environments,
+                        dry_run,
+                    })
+                    .await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!(
+                        "{}: {} -> {} logical bytes (target {})",
+                        if report.dry_run { "plan" } else { "pruned" },
+                        report.plan.before_bytes,
+                        report.after_bytes,
+                        report.plan.maximum_bytes
+                    );
+                    for entry in &report.plan.selected {
+                        println!(
+                            "{}\t{:?}\t{}\t{}",
+                            if report.dry_run {
+                                "would-remove"
+                            } else {
+                                "selected"
+                            },
+                            entry.kind,
+                            entry.size_bytes,
+                            entry.key
+                        );
+                    }
+                    for failure in &report.failures {
+                        eprintln!(
+                            "warning: could not remove {}: {}",
+                            failure.entry.key, failure.message
+                        );
+                    }
+                    if !report.target_met {
+                        eprintln!(
+                            "warning: cache target was not reached; protected or in-use entries remain"
+                        );
+                    }
+                }
+                Ok(if report.failures.is_empty() { 0 } else { 1 })
+            }
         },
+    }
+}
+
+async fn create_environment(service: &AgentSandbox, arguments: EnvCreateArgs) -> Result<i32> {
+    let output = arguments.output;
+    match service
+        .prepare_environment(EnvironmentBuildOptions {
+            name: arguments.name,
+            base: arguments.base,
+            toolchains: arguments.toolchain,
+            cpus: arguments.cpus,
+            memory: arguments.memory,
+            disk: arguments.disk,
+            force: arguments.force,
+        })
+        .await?
+    {
+        PreparedEnvironment::Cached(record) => {
+            match output {
+                OutputArg::Text => {
+                    println!("cache hit: {} ({})", record.name, record.snapshot);
+                }
+                OutputArg::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"cached": true, "environment": record})
+                    )?
+                ),
+                OutputArg::Jsonl => println!(
+                    "{}",
+                    serde_json::json!({"type": "environment.ready", "cached": true, "environment": record})
+                ),
+            }
+            Ok(0)
+        }
+        PreparedEnvironment::Building(mut builder) => {
+            let builder_id = builder.id.clone();
+            if output == OutputArg::Jsonl {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "type": "environment.builder_started",
+                        "id": builder_id,
+                        "name": builder.build.name,
+                        "cache_key": builder.build.cache_key,
+                    })
+                );
+            }
+            let stream = builder.take_stream()?;
+            let format = match output {
+                OutputArg::Text => OutputFormat::Text,
+                OutputArg::Json => OutputFormat::Capture,
+                OutputArg::Jsonl => OutputFormat::JsonLines,
+            };
+            let summary = match forward(stream, format, builder.memory_tail_bytes).await {
+                Ok(summary) => summary,
+                Err(error) => {
+                    let cleanup = service.abort_environment(&builder_id).await;
+                    if let Err(cleanup_error) = cleanup {
+                        return Err(anyhow::anyhow!(
+                            "{error}; additionally failed to clean up builder {builder_id}: {cleanup_error}"
+                        ));
+                    }
+                    return Err(error.into());
+                }
+            };
+            if summary.exit_code != 0 {
+                service.abort_environment(&builder_id).await?;
+                if output == OutputArg::Json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "cached": false,
+                            "builder_id": builder_id,
+                            "exit_code": summary.exit_code,
+                            "stdout": String::from_utf8_lossy(&summary.stdout_tail),
+                            "stdout_base64": STANDARD.encode(&summary.stdout_tail),
+                            "stdout_truncated": summary.stdout_truncated,
+                            "stderr": String::from_utf8_lossy(&summary.stderr_tail),
+                            "stderr_base64": STANDARD.encode(&summary.stderr_tail),
+                            "stderr_truncated": summary.stderr_truncated,
+                        }))?
+                    );
+                }
+                return Ok(summary.exit_code);
+            }
+            let record = service.finalize_environment(*builder).await?;
+            match output {
+                OutputArg::Text => {
+                    println!("environment ready: {} ({})", record.name, record.snapshot);
+                }
+                OutputArg::Json => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "cached": false,
+                        "environment": record,
+                        "exit_code": summary.exit_code,
+                        "stdout": String::from_utf8_lossy(&summary.stdout_tail),
+                        "stdout_base64": STANDARD.encode(&summary.stdout_tail),
+                        "stdout_truncated": summary.stdout_truncated,
+                        "stderr": String::from_utf8_lossy(&summary.stderr_tail),
+                        "stderr_base64": STANDARD.encode(&summary.stderr_tail),
+                        "stderr_truncated": summary.stderr_truncated,
+                    }))?
+                ),
+                OutputArg::Jsonl => println!(
+                    "{}",
+                    serde_json::json!({"type": "environment.ready", "cached": false, "environment": record})
+                ),
+            }
+            Ok(0)
+        }
     }
 }
 
@@ -626,11 +952,82 @@ fn print_summary(summary: &ExecSummary) -> Result<()> {
 }
 
 fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOptions> {
-    if !matches!(arguments.project_mode, ProjectModeArg::Copy) {
-        bail!(
-            "project mode {:?} is not enabled in Phase 1; use the safe default --project-mode copy",
-            arguments.project_mode
+    let project_mode = match arguments.project_mode {
+        ProjectModeArg::Copy => ProjectMode::Copy,
+        ProjectModeArg::MountRo => ProjectMode::MountReadOnly,
+        ProjectModeArg::MountRw => ProjectMode::MountReadWrite,
+    };
+    if project_mode == ProjectMode::MountReadWrite {
+        eprintln!(
+            "warning: --project-mode mount-rw lets guest processes modify the authorized host project"
         );
+    }
+    let mut network_rules = Vec::new();
+    extend_string_rules(
+        &mut network_rules,
+        NetworkRuleAction::Allow,
+        arguments.allow_domains,
+        NetworkRuleTarget::Domain,
+    );
+    extend_string_rules(
+        &mut network_rules,
+        NetworkRuleAction::Deny,
+        arguments.deny_domains,
+        NetworkRuleTarget::Domain,
+    );
+    extend_string_rules(
+        &mut network_rules,
+        NetworkRuleAction::Allow,
+        arguments.allow_domain_suffixes,
+        NetworkRuleTarget::DomainSuffix,
+    );
+    extend_string_rules(
+        &mut network_rules,
+        NetworkRuleAction::Deny,
+        arguments.deny_domain_suffixes,
+        NetworkRuleTarget::DomainSuffix,
+    );
+    extend_string_rules(
+        &mut network_rules,
+        NetworkRuleAction::Allow,
+        arguments.allow_cidrs,
+        NetworkRuleTarget::Cidr,
+    );
+    extend_string_rules(
+        &mut network_rules,
+        NetworkRuleAction::Deny,
+        arguments.deny_cidrs,
+        NetworkRuleTarget::Cidr,
+    );
+    network_rules.extend(
+        arguments
+            .allow_ports
+            .into_iter()
+            .map(|(start, end)| NetworkRule {
+                action: NetworkRuleAction::Allow,
+                target: NetworkRuleTarget::PublicPort { start, end },
+            }),
+    );
+    network_rules.extend(
+        arguments
+            .deny_ports
+            .into_iter()
+            .map(|(start, end)| NetworkRule {
+                action: NetworkRuleAction::Deny,
+                target: NetworkRuleTarget::PublicPort { start, end },
+            }),
+    );
+    for (enabled, target) in [
+        (arguments.allow_private, NetworkRuleTarget::Private),
+        (arguments.allow_host, NetworkRuleTarget::Host),
+        (arguments.allow_metadata, NetworkRuleTarget::Metadata),
+    ] {
+        if enabled {
+            network_rules.push(NetworkRule {
+                action: NetworkRuleAction::Allow,
+                target,
+            });
+        }
     }
     Ok(SandboxOptions {
         project: arguments.project,
@@ -648,13 +1045,29 @@ fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOptions> {
         network: arguments.network.map(|network| match network {
             NetworkArg::Off => NetworkMode::Off,
             NetworkArg::Public => NetworkMode::Public,
+            NetworkArg::Dependencies => NetworkMode::Dependencies,
+            NetworkArg::Rules => NetworkMode::Rules,
             NetworkArg::All => NetworkMode::All,
         }),
+        network_rules,
+        project_mode,
         timeout: arguments.timeout,
         ttl: arguments.ttl,
         env: arguments.env_vars,
         ports: arguments.publish,
     })
+}
+
+fn extend_string_rules(
+    rules: &mut Vec<NetworkRule>,
+    action: NetworkRuleAction,
+    values: Vec<String>,
+    target: impl Fn(String) -> NetworkRuleTarget,
+) {
+    rules.extend(values.into_iter().map(|value| NetworkRule {
+        action,
+        target: target(value),
+    }));
 }
 
 fn exec_request(
@@ -712,6 +1125,27 @@ fn publish_value(value: &str) -> std::result::Result<RequestedPort, String> {
         guest_port,
         host_port,
     })
+}
+
+fn port_range_value(value: &str) -> std::result::Result<(u16, u16), String> {
+    let (start, end) = value
+        .split_once('-')
+        .map(|(start, end)| (start, Some(end)))
+        .unwrap_or((value, None));
+    let start = start
+        .parse::<u16>()
+        .map_err(|_| "port must be between 1 and 65535".to_owned())?;
+    let end = end
+        .map(|end| {
+            end.parse::<u16>()
+                .map_err(|_| "port must be between 1 and 65535".to_owned())
+        })
+        .transpose()?
+        .unwrap_or(start);
+    if start == 0 || start > end {
+        return Err("port range must be ascending and between 1 and 65535".into());
+    }
+    Ok((start, end))
 }
 
 fn init_logging(verbose: bool) {

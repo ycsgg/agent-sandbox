@@ -13,7 +13,13 @@ Important options:
 - `--image OCI_REF` or `--snapshot NAME`
 - `--cpus N`, `--memory SIZE`, `--disk SIZE`
 - `--user USER`, `--security default|restricted`
-- `--network off|public|all`
+- `--project-mode copy|mount-ro|mount-rw`
+- `--network off|public|dependencies|rules|all`
+- custom rules: `--allow-domain`, `--deny-domain`,
+  `--allow-domain-suffix`, `--deny-domain-suffix`, `--allow-cidr`,
+  `--deny-cidr`, `--allow-port`, and `--deny-port`; protected destinations
+  additionally use host-gated `--allow-private`, `--allow-host`, or
+  `--allow-metadata`
 - `--timeout DURATION`, `--ttl DURATION`
 - `--publish GUEST_PORT[:HOST_PORT]`
 - `--env-var KEY=VALUE`
@@ -26,6 +32,10 @@ tails. JSONL emits streaming control and output events.
 Copy mode honors `.gitignore` and `.agent-sandbox-ignore`. Keep generated,
 vendored, or local runtime source trees out of the guest through those files;
 the wrapper also applies entry-count, per-file, and total-byte caps.
+
+Mounts expose only the canonical authorized project. `mount-ro` prevents guest
+writes. `mount-rw` is host-policy gated, quota-limited, and intentionally lets
+guest code change host project files.
 
 ## Persistent sessions
 
@@ -57,6 +67,17 @@ remain inside an authorized workspace root.
 
 ```bash
 asbx env detect --project . --json
+asbx env create NAME --base ubuntu:24.04 \
+  --toolchain go@1.24 --toolchain rust@1.88 --toolchain node@22
+asbx env list [--json]
+asbx env inspect NAME [--json]
+asbx env remove NAME
 asbx doctor [--json]
 asbx cache status [--json]
+asbx cache prune [--max-size SIZE] [--older-than DURATION] \
+  [--include-environments] [--dry-run] [--json]
 ```
+
+Managed environment cache keys include the resolved base-image manifest
+digest, host architecture, normalized toolchain versions, and provisioning
+manifest version. Cache pruning protects named environments by default.

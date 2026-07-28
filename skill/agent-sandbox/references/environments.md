@@ -3,7 +3,7 @@
 `asbx env detect` statically reads bounded declaration files; it never executes
 project code.
 
-Supported Phase 1 fast paths:
+Supported fast paths:
 
 | Project declaration | Environment | OCI image |
 |---|---|---|
@@ -11,9 +11,24 @@ Supported Phase 1 fast paths:
 | `rust-toolchain*`, `Cargo.toml` | `rust@VERSION` | official `rust` Bookworm image |
 | `.nvmrc`, `.node-version`, `package.json`, `tsconfig*.json` | `node@VERSION` | official `node` Bookworm image |
 
-Use `--env auto` for a single supported runtime. Use an explicit `--image` for:
+Use `--env auto` for a single supported runtime. Build a named environment for
+multiple toolchains:
 
-- multiple language runtimes;
+```bash
+asbx env create audit-full --base ubuntu:24.04 \
+  --toolchain go@1.24 \
+  --toolchain rust@1.88 \
+  --toolchain node@22
+asbx run --project . --env audit-full -- ./scripts/verify.sh
+```
+
+Builder snapshots contain wrapper-managed toolchains but no project files or
+install hooks. Exact Node.js builders require a glibc base such as Ubuntu or
+Debian. Builder architecture is derived from the host, so the same CLI works
+on supported x86_64 and arm64 hosts.
+
+Use an explicit `--image` for:
+
 - Python, Java, or other ecosystems;
 - native system dependencies not present in the fast-path image;
 - a fully reproducible image digest;

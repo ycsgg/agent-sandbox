@@ -12,6 +12,8 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "agent-sandbox-cache"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "serde",
  "thiserror 2.0.19",
 ]
 
@@ -40,6 +42,7 @@ dependencies = [
 name = "agent-sandbox-core"
 version = "0.1.0"
 dependencies = [
+ "agent-sandbox-cache",
  "agent-sandbox-detector",
  "agent-sandbox-environment",
  "agent-sandbox-policy",
@@ -54,6 +57,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
  "ulid",
 ]
 
@@ -74,7 +78,10 @@ version = "0.1.0"
 dependencies = [
  "agent-sandbox-detector",
  "agent-sandbox-runtime",
+ "hex",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.19",
 ]
 
@@ -95,6 +102,7 @@ version = "0.1.0"
 dependencies = [
  "agent-sandbox-runtime",
  "dirs",
+ "ipnet",
  "serde",
  "tempfile",
  "thiserror 2.0.19",
@@ -119,7 +127,10 @@ version = "0.1.0"
 dependencies = [
  "agent-sandbox-runtime",
  "async-trait",
+ "chrono",
+ "ipnet",
  "microsandbox",
+ "microsandbox-network",
  "tokio",
 ]
 
@@ -132,6 +143,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sysinfo",
  "tempfile",
  "thiserror 2.0.19",
 ]
@@ -2887,6 +2899,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntapi"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3b335231dfd352ffb0f8017f3b6027a4917f7df785ea2143d8af2adc66980ae"
+dependencies = [
+ "winapi",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2954,6 +2975,25 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "objc2-core-foundation"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c10c2894a6fed806ade6027bcd50662746363a9589d3ec9d9bef30a4e4bc166"
+dependencies = [
+ "bitflags 2.13.1",
+]
+
+[[package]]
+name = "objc2-io-kit"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71c1c64d6120e51cd86033f67176b1cb66780c2efe34dec55176f77befd93c0a"
+dependencies = [
+ "libc",
+ "objc2-core-foundation",
 ]
 
 [[package]]
@@ -4508,6 +4548,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "sysinfo"
+version = "0.38.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d03c61d2a49c649a15c407338afe7accafde9dac869995dccb73e5f7ef7d9034"
+dependencies = [
+ "libc",
+ "memchr",
+ "ntapi",
+ "objc2-core-foundation",
+ "objc2-io-kit",
+ "windows",
 ]
 
 [[package]]

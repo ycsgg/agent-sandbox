@@ -25,11 +25,18 @@ host as a fallback. Diagnose the sandbox or ask the user how to proceed.
 - Keep the default copy mode. It prevents guest writes from changing the host
   project, honors `.gitignore` and `.agent-sandbox-ignore`, and excludes
   `.git`, dependency, build, and coverage directories.
+- Use `--project-mode mount-ro` when the guest needs a live view of host edits.
+  Use `mount-rw` only when host-file mutation is required and the user accepts
+  that boundary; host policy must enable it and applies a write quota.
 - Choose `--network off` for offline checks and `--network public` when package
   installation needs the Internet. Public mode still denies host and private
   networks.
+- Prefer `--network dependencies` for Go, Cargo, or npm registry access. Use
+  `--network rules` with explicit domain/CIDR/port flags for a custom
+  deny-by-default policy. Private, host, and metadata allows require an
+  explicit host-policy override.
 - Use `--network all` only if the host configuration permits it and the task
-  truly requires private/host access.
+  genuinely requires unrestricted access.
 - Pass only specific values with `--env-var KEY=VALUE`. Host environment
   variables and credentials are not inherited.
 - Write reports or build outputs that must leave the VM below `/out`.

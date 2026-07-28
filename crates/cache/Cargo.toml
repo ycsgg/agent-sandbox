@@ -9,4 +9,6 @@ license.workspace = true
 path = "lib/lib.rs"
 
 [dependencies]
+chrono.workspace = true
+serde.workspace = true
 thiserror.workspace = true

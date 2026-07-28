@@ -2,7 +2,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::{path::Path, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -46,8 +50,87 @@ pub enum NetworkMode {
     Off,
     /// Public Internet only; private, host, link-local, and metadata addresses are denied.
     Public,
+    /// Registry endpoints inferred from project declarations.
+    Dependencies,
+    /// A deny-by-default custom rule set.
+    Rules,
     /// Unrestricted networking. This is intentionally high risk.
     All,
+}
+
+/// Action applied by a custom network rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkRuleAction {
+    /// Permit matching traffic.
+    Allow,
+    /// Drop matching traffic.
+    Deny,
+}
+
+/// Destination matched by a custom egress rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
+pub enum NetworkRuleTarget {
+    /// Exact DNS name.
+    Domain(String),
+    /// Apex DNS name and all subdomains.
+    DomainSuffix(String),
+    /// IP address or CIDR.
+    Cidr(String),
+    /// Public destinations on one inclusive TCP/UDP port range.
+    PublicPort {
+        /// First port.
+        start: u16,
+        /// Last port.
+        end: u16,
+    },
+    /// Private address groups.
+    Private,
+    /// The host gateway.
+    Host,
+    /// Cloud metadata endpoints.
+    Metadata,
+}
+
+/// One ordered custom network rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkRule {
+    /// Allow or deny action.
+    pub action: NetworkRuleAction,
+    /// Destination matcher.
+    pub target: NetworkRuleTarget,
+}
+
+/// Project exposure mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectMode {
+    /// Copy validated project files to a private guest disk.
+    Copy,
+    /// Bind the project read-only at `/workspace`.
+    MountReadOnly,
+    /// Bind the project read-write at `/workspace`.
+    MountReadWrite,
+}
+
+/// Host workspace exposure passed to a runtime backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "kebab-case")]
+pub enum WorkspaceSpec {
+    /// No project is exposed, as used by trusted environment builders.
+    None,
+    /// Project files are copied after VM creation.
+    Copy,
+    /// A host directory is mounted at `/workspace`.
+    Mount {
+        /// Canonical host directory.
+        host: PathBuf,
+        /// Prevent all guest writes.
+        read_only: bool,
+        /// Guest growth quota in MiB for writable mounts.
+        write_quota_mib: Option<u32>,
+    },
 }
 
 /// Guest security profile.
@@ -98,6 +181,10 @@ pub struct CreateSpec {
     pub security: SecurityMode,
     /// Effective network mode.
     pub network: NetworkMode,
+    /// Ordered custom/dependency network rules.
+    pub network_rules: Vec<NetworkRule>,
+    /// Project copy or mount exposure.
+    pub workspace: WorkspaceSpec,
     /// Explicit environment injected into the guest.
     pub env: Vec<(String, String)>,
     /// Published loopback ports.
@@ -187,6 +274,40 @@ pub struct SandboxInfo {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// Runtime snapshot metadata used for managed environments and cache policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotInfo {
+    /// Human-readable snapshot name.
+    pub name: String,
+    /// Content-addressed manifest digest.
+    pub digest: String,
+    /// Pinned base image reference.
+    pub image: String,
+    /// Content-addressed base image manifest digest.
+    pub image_manifest_digest: String,
+    /// Apparent writable-layer bytes.
+    pub size_bytes: u64,
+    /// Creation time when available.
+    pub created_at: Option<DateTime<Utc>>,
+    /// Snapshot labels.
+    pub labels: BTreeMap<String, String>,
+}
+
+/// Runtime OCI image-cache metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageInfo {
+    /// OCI reference.
+    pub reference: String,
+    /// Content-addressed OCI manifest digest.
+    pub manifest_digest: Option<String>,
+    /// Logical image bytes.
+    pub size_bytes: u64,
+    /// Most recent cache use time.
+    pub last_used_at: Option<DateTime<Utc>>,
+    /// Initial cache creation time.
+    pub created_at: Option<DateTime<Utc>>,
+}
+
 /// Guest filesystem entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuestEntry {
@@ -259,4 +380,27 @@ pub trait SandboxRuntime: Send + Sync {
 
     /// Check whether runtime prerequisites are ready.
     async fn doctor(&self) -> Result<Vec<(String, bool, String)>>;
+
+    /// Create a disk snapshot from a stopped sandbox.
+    async fn create_snapshot(
+        &self,
+        name: &str,
+        sandbox: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<SnapshotInfo>;
+
+    /// List runtime snapshots.
+    async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>>;
+
+    /// Inspect one runtime snapshot.
+    async fn inspect_snapshot(&self, name: &str) -> Result<SnapshotInfo>;
+
+    /// Remove one runtime snapshot.
+    async fn remove_snapshot(&self, name: &str) -> Result<()>;
+
+    /// List cached OCI image references.
+    async fn list_images(&self) -> Result<Vec<ImageInfo>>;
+
+    /// Remove one cached OCI image reference if unused.
+    async fn remove_image(&self, reference: &str) -> Result<()>;
 }

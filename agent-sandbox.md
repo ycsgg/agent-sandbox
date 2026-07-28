@@ -510,7 +510,7 @@ asbx open --project . --project-mode mount-rw
 guest 将结果写入 `/out`：
 
 ```bash
-asbx artifacts sbx_01J...
+asbx artifact list sbx_01J...
 asbx artifact get sbx_01J... /out/report.json --to ./report.json
 ```
 
@@ -673,12 +673,14 @@ roots = [
   "/Users/example/labs",
 ]
 allow_rw_mount = true
+rw_mount_quota = "2G"
 
 [network]
 default = "public"
 allow_all_mode = true
 allow_private_override = true
 allow_non_loopback_publish = false
+max_custom_rules = 64
 
 [resources]
 default_cpus = 2
@@ -692,6 +694,9 @@ max_disk = "64G"
 memory_tail = "2M"
 max_log_disk = "128M"
 max_artifact_total = "2G"
+
+[cache]
+max_size = "50G"
 ```
 
 这里的默认值应保持宽松、可见和可配置，不把特定数字写死在 Skill。
@@ -734,9 +739,9 @@ stop guest
 - sandbox 运行日志，除非 Agent指定保留。
 - 端口映射和 runtime socket。
 
-## 15. 实现阶段
+## 15. 实现状态
 
-### Phase 1：最小可用闭环
+### Phase 1：最小可用闭环（已实现）
 
 - Rust workspace 和 `asbx` CLI。
 - Microsandbox adapter。
@@ -754,24 +759,24 @@ stop guest
 - `env detect`。
 - `--env auto`。
 - toolchain catalog。
-- 多语言 environment builder。
-- environment snapshot cache。
+- 多语言 environment builder。（已实现）
+- environment snapshot cache。（已实现）
 - `.agent-sandbox.yaml`。
 
 ### Phase 3：开发与审计体验
 
-- workspace mount。
-- artifact broker。
-- service port 发布。
-- JSONL 事件。
+- workspace mount。（已实现）
+- artifact broker。（已实现）
+- service port 发布。（已实现）
+- JSONL 事件。（已实现）
 - log retention。
-- cache quota/LRU。
+- cache quota/LRU。（已实现）
 
 ### Phase 4：跨平台与加固
 
-- Linux x86_64/arm64 CI。
-- macOS arm64 CI。
-- Windows x86_64/arm64 CI。
+- Linux x86_64/arm64 CI。（已配置）
+- macOS arm64 CI。（已配置）
+- Windows x86_64/arm64 CI。（已配置）
 - 父进程崩溃、宿主重启和强制 kill 测试。
 - 性能基准和长时间稳定性测试。
 

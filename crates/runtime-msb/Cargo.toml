@@ -11,5 +11,8 @@ path = "lib/lib.rs"
 [dependencies]
 agent-sandbox-runtime.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
+ipnet.workspace = true
 microsandbox.workspace = true
+microsandbox-network.workspace = true
 tokio.workspace = true
