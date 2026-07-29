@@ -27,6 +27,23 @@ machine command must pass `--user`.
 Use `asbx inspect ID --json` to locate the serial log and active QMP, SSH, and
 GDB loopback endpoints. Use `--project-mode none` for machines without SSH.
 
+## QEMU debugger does not attach
+
+Inspect a non-mutating, structured launch plan:
+
+```bash
+asbx debug ID --print-command --json
+```
+
+The session must be active and opened with `--gdb`. Use `--pause-at-boot` when
+early startup matters. TCG provides the most consistent breakpoint and
+watchpoint behavior; hardware accelerators may expose fewer debug features.
+For Linux source-level debugging, pass a matching uncompressed `vmlinux` with
+debug information through `--symbols` and boot with
+`--kernel-append nokaslr`. Without symbols, `asbx debug` connects without
+loading a host file and still supports register, memory, and remote
+assembly-level inspection.
+
 ## Auto detection fails
 
 Inspect:

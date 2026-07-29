@@ -29,6 +29,8 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing_subscriber::EnvFilter;
 
+mod debugger;
+
 //--------------------------------------------------------------------------------------------------
 // Types
 //--------------------------------------------------------------------------------------------------
@@ -76,6 +78,8 @@ enum Command {
     Exec(SessionExecArgs),
     /// Attach an interactive terminal to an open session.
     Shell(ShellArgs),
+    /// Attach LLDB or GDB to a QEMU machine's loopback debug stub.
+    Debug(debugger::DebugArgs),
     /// Stop and remove an open session.
     Close {
         /// Sandbox session ID.
@@ -615,6 +619,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 .await?;
             Ok(code)
         }
+        Command::Debug(arguments) => debugger::run(&service, arguments).await,
         Command::Close { id } => {
             service.close(&id).await?;
             Ok(0)

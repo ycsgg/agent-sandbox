@@ -69,9 +69,12 @@ asbx inspect "$id" --json
 asbx close "$id"
 
 # Direct kernel boot with an automatically allocated loopback GDB port.
-asbx open --backend qemu --kernel ./Image --initrd ./initramfs.cpio.gz \
+id="$(asbx open --backend qemu --kernel ./Image --initrd ./initramfs.cpio.gz \
   --kernel-append 'console=ttyAMA0' --gdb --pause-at-boot \
-  --project-mode none --network off --output json
+  --project-mode none --network off)"
+asbx debug "$id" --print-command --json
+asbx debug "$id" --symbols ./vmlinux
+asbx close "$id"
 ```
 
 QEMU machine mode defaults to no workspace and offline networking. A writable
@@ -83,6 +86,13 @@ Microsandbox capability; QEMU currently accepts only `off` and host-gated
 `all`. QEMU lease expiry is enforced on the next `asbx` invocation; unlike
 Microsandbox, the QEMU adapter does not install an always-running TTL helper.
 
+`asbx debug` validates the session, loopback endpoint, symbol architecture,
+and debugger executable before attaching. It automatically selects LLDB on
+macOS and GDB on other hosts. Without `--symbols`, a direct-boot kernel is
+reported as context but is not loaded into the host debugger; remote
+registers, memory, and disassembly remain available. Debugger init files and
+symbol-script auto-loading are disabled by default.
+
 See [`skill/agent-sandbox/SKILL.md`](skill/agent-sandbox/SKILL.md) and
 [`agent-sandbox.md`](agent-sandbox.md) for workflows and design rationale.
 
@@ -93,3 +103,7 @@ unless `workspace.allow_rw_mount` is enabled. Named environments contain only
 trusted wrapper provisioning, never project install hooks. Cache pruning keeps
 named environments by default; use `--include-environments` explicitly and
 review `--dry-run` output before removing them.
+
+`asbx debug --symbols` causes a trusted host debugger to parse that file.
+Supply only a symbol artifact you intend to expose to a host process; the
+guest boot image is never loaded implicitly.

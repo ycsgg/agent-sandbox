@@ -159,6 +159,34 @@ asbx close sbx_01J...
 asbx touch sbx_01J... --ttl 2h
 ```
 
+#### 4.2.1 QEMU 调试会话
+
+Agent 不需要读取 QEMU state file、解析动态端口或拼接 debugger shell
+命令。wrapper 把运行时上下文转换为结构化调试计划：
+
+```bash
+id="$(asbx open --backend qemu --kernel ./Image --initrd ./initramfs \
+  --accelerator tcg --kernel-append nokaslr --gdb --pause-at-boot \
+  --project-mode none --network off)"
+
+asbx debug "$id" --print-command --json
+asbx debug "$id" --symbols ./vmlinux
+asbx close "$id"
+```
+
+`asbx debug` 负责：
+
+- 从 backend metadata 获取 loopback GDB endpoint、架构、加速器和暂停状态。
+- 自动发现 GDB/LLDB，始终通过参数数组启动，不经 shell。
+- 校验 ELF/PE symbol file 的架构与 guest 一致。
+- 对缺少 symbol、未暂停、KASLR 和非 TCG 加速器给出结构化提示。
+- 通过 `--print-command --json` 将完整 program/arguments 交给 Agent 或 IDE。
+- 默认不加载 guest boot image，并关闭 debugger init 与 symbol-script
+  auto-load；只有显式 `--symbols` 才让宿主 debugger 解析文件。
+
+内核构建、源码获取和特定调试过程不进入 wrapper；调用方只需提供匹配的
+boot image、initramfs 和可选 `vmlinux`。
+
 ### 4.3 自由选择 OCI 镜像
 
 Agent 可以绕过自动检测，直接选择镜像：
@@ -833,6 +861,8 @@ wrapper 必须用真实 hostile workloads 验证：
 9. 一次性任务结束后没有常驻 VMM 进程。
 10. 相同环境第二次运行能够复用 OCI cache 或 snapshot。
 11. Skill 能指导 Agent 在 one-shot、session、service 三种模式间正确选择。
+12. Agent 可以通过结构化计划连接 QEMU debugger，无需处理动态端口或
+    debugger 参数差异。
 
 ## 18. 最终产品形态
 

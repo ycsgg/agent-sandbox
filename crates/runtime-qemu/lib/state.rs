@@ -25,6 +25,12 @@ pub(crate) struct MachineState {
     pub ssh_port: Option<u16>,
     #[serde(default)]
     pub gdb_port: Option<u16>,
+    #[serde(default)]
+    pub debug_paused_at_boot: bool,
+    #[serde(default)]
+    pub kaslr_disabled: bool,
+    #[serde(default)]
+    pub kernel: Option<PathBuf>,
     pub ssh_user: Option<String>,
     pub ssh_key: Option<PathBuf>,
     pub serial_log: PathBuf,
@@ -88,5 +94,43 @@ pub(crate) fn io_error(
     RuntimeError::Backend {
         operation,
         message: format!("{}: {error}", path.display()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn older_v1_state_defaults_new_debug_context() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "id": "sbx_qemu_legacy",
+                "pid": 42,
+                "process_started_at": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+                "architecture": "aarch64",
+                "accelerator": "tcg",
+                "qmp_port": 1234,
+                "ssh_port": null,
+                "gdb_port": 1235,
+                "ssh_user": null,
+                "ssh_key": null,
+                "serial_log": "serial.log",
+                "process_log": "qemu.log"
+            }"#,
+        )
+        .unwrap();
+
+        let state = load(&path).unwrap();
+        assert!(!state.debug_paused_at_boot);
+        assert!(!state.kaslr_disabled);
+        assert_eq!(state.kernel, None);
     }
 }

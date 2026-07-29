@@ -48,6 +48,24 @@ Machine inputs are `--root-disk`, `--disk-format raw|qcow2`, `--kernel`,
 loopback GDB stub; `--pause-at-boot` starts CPUs paused. An omitted GDB port is
 allocated automatically and reported by `inspect`.
 
+Attach a host debugger without manually parsing runtime metadata:
+
+```bash
+asbx debug ID --print-command --json
+asbx debug ID --symbols ./vmlinux
+asbx debug ID --debugger lldb --command 'register read pc'
+```
+
+`--debugger auto|gdb|lldb` controls discovery; `--debugger-binary` selects an
+explicit executable. Repeat `--debugger-arg` for native debugger options and
+`--command` for commands that must run after the remote connection is
+established. The structured plan contains `ready`, `endpoint`, `architecture`,
+`accelerator`, `symbol_mode`, the exact program/argument array, and warnings.
+Endpoints must be loopback. An explicit symbol file must be a regular file and
+its recognized ELF/PE architecture must match the guest. Guest boot images are
+reported but never loaded implicitly into the host debugger. GDB/LLDB init
+files and symbol-script auto-loading are disabled by default.
+
 QEMU machine mode defaults to `--project-mode none` and `--network off`.
 Writable disks use a temporary snapshot and do not mutate the base image.
 Guests need an SSH service plus `qemu.ssh_user`/`qemu.ssh_key` (or `--user`)

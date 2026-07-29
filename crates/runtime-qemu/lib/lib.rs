@@ -255,17 +255,20 @@ impl SandboxRuntime for QemuRuntime {
         } else {
             None
         };
-        let gdb_port = match &spec.root {
-            agent_sandbox_runtime::RootSource::Machine(machine) => machine.debug.map(|debug| {
+        let machine = match &spec.root {
+            agent_sandbox_runtime::RootSource::Machine(machine) => Some(machine.as_ref()),
+            _ => None,
+        };
+        let debug = machine.and_then(|machine| machine.debug);
+        let gdb_port = debug
+            .map(|debug| {
                 if debug.gdb_port == 0 {
                     allocate_loopback_port()
                 } else {
                     Ok(debug.gdb_port)
                 }
-            }),
-            _ => None,
-        }
-        .transpose()?;
+            })
+            .transpose()?;
         if let Some(port) = gdb_port
             && (port == qmp_port
                 || ssh_port == Some(port)
@@ -333,6 +336,15 @@ impl SandboxRuntime for QemuRuntime {
             qmp_port,
             ssh_port: plan.ssh_port,
             gdb_port: plan.gdb_port,
+            debug_paused_at_boot: debug.is_some_and(|debug| debug.pause_at_boot),
+            kaslr_disabled: machine.is_some_and(|machine| {
+                machine
+                    .kernel_append
+                    .iter()
+                    .flat_map(|fragment| fragment.split_ascii_whitespace())
+                    .any(|argument| argument == "nokaslr")
+            }),
+            kernel: machine.and_then(|machine| machine.kernel.clone()),
             ssh_user,
             ssh_key: self.config.ssh_key.clone(),
             serial_log,
@@ -674,6 +686,14 @@ impl SandboxRuntime for QemuRuntime {
         }
         if let Some(port) = state.gdb_port {
             metadata.insert("gdb".into(), format!("tcp://127.0.0.1:{port}"));
+            metadata.insert(
+                "debug_paused_at_boot".into(),
+                state.debug_paused_at_boot.to_string(),
+            );
+            metadata.insert("kaslr_disabled".into(), state.kaslr_disabled.to_string());
+        }
+        if let Some(kernel) = state.kernel {
+            metadata.insert("kernel".into(), kernel.display().to_string());
         }
         Ok(SandboxInfo {
             id: state.id,

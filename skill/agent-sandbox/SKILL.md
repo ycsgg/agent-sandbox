@@ -16,11 +16,27 @@ install hooks, build scripts, tests, or downloaded binaries.
 4. Use `open → exec → close` for dependency installation, multiple commands,
    debugging, or services.
 5. Use `asbx shell ID` only when an interactive terminal is necessary.
+6. For QEMU machine debugging, open with `--gdb` and use
+   `asbx debug ID --print-command --json` before attaching symbols or an
+   interactive debugger.
 
 Use the default Microsandbox backend for OCI images and project workflows.
 Select `--backend qemu` only when the task supplies a bootable disk or kernel
 and needs full-system, cross-architecture, serial, QMP, or GDB capabilities.
 Check available features with `asbx backend list --json`.
+
+For a paused, symbol-aware machine debug session:
+
+```bash
+id="$(asbx open --backend qemu --kernel ./Image --initrd ./initramfs \
+  --accelerator tcg --kernel-append nokaslr --gdb --pause-at-boot \
+  --project-mode none --network off)"
+asbx debug "$id" --symbols ./vmlinux
+asbx close "$id"
+```
+
+The debug command discovers the loopback endpoint and host debugger. Prefer
+`--print-command --json` when another Agent or IDE will launch the debugger.
 
 Never run a project's install, build, test, or audit command directly on the
 host as a fallback. Diagnose the sandbox or ask the user how to proceed.
