@@ -627,7 +627,7 @@ stdout/stderr 的原始内容与控制事件应使用不同 fd 或统一 JSONL�
 agent-sandbox/
 ├── crates/
 │   ├── core/          # spec、lease、状态机
-│   ├── cli/           # asbx
+│   ├── cli/           # asbx 参数、装配、命令编排和请求转换
 │   ├── policy/        # 宿主底线与 effective config
 │   ├── detector/      # 项目环境检测
 │   ├── environment/   # OCI、toolchain、snapshot
@@ -646,21 +646,66 @@ agent-sandbox/
     └── agent-sandbox/
 ```
 
-backend trait：
+CLI 内部按职责拆分：
+
+```text
+main.rs                 # 进程入口
+app.rs                  # Clap 参数模型
+app/bootstrap.rs        # 配置、状态和 concrete backend 装配
+app/commands.rs         # 命令分派与用户可见工作流
+app/request.rs          # CLI 参数 → runtime-neutral core request
+debugger.rs             # debugger 发现、计划和启动
+```
+
+backend contract 使用 lifecycle + optional capabilities，而不是要求每个
+backend 实现一个不断变大的接口：
 
 ```rust
 trait SandboxRuntime {
-    async fn create(&self, spec: EffectiveSpec) -> Result<SandboxHandle>;
+    fn backend_id(&self) -> BackendId;
+    fn capabilities(&self) -> BackendCapabilities;
+
+    // 均有默认 None；backend 只暴露真实支持的能力。
+    fn command_runtime(&self) -> Option<&dyn CommandRuntime> { None }
+    fn file_transfer_runtime(&self) -> Option<&dyn FileTransferRuntime> { None }
+    fn snapshot_runtime(&self) -> Option<&dyn SnapshotRuntime> { None }
+    fn debug_runtime(&self) -> Option<&dyn DebugRuntime> { None }
+
+    async fn create(&self, spec: &CreateSpec) -> Result<SandboxInfo>;
+    async fn stop(&self, sandbox: &str) -> Result<()>;
+    async fn kill(&self, sandbox: &str) -> Result<()>;
+    async fn remove(&self, sandbox: &str) -> Result<()>;
+    async fn list(&self) -> Result<Vec<SandboxInfo>>;
+    async fn inspect(&self, sandbox: &str) -> Result<SandboxInfo>;
+    async fn doctor(&self) -> Result<Vec<(String, bool, String)>>;
+}
+
+trait CommandRuntime {
     async fn exec_stream(
-        &self,
-        sandbox: &SandboxId,
-        request: ExecRequest,
+        &self, sandbox: &str, request: ExecRequest
     ) -> Result<ExecStream>;
-    async fn stop(&self, sandbox: &SandboxId) -> Result<()>;
-    async fn kill(&self, sandbox: &SandboxId) -> Result<()>;
-    async fn remove(&self, sandbox: &SandboxId) -> Result<()>;
 }
 ```
+
+新增 backend 的稳定接入面：
+
+1. 实现 `SandboxRuntime` 生命周期，不需要 snapshot/image/exec 的空桩。
+2. 按实际能力选择实现 `CommandRuntime`、`TerminalRuntime`、
+   `FileTransferRuntime`、`SnapshotRuntime`、`ImageRuntime` 或
+   `DebugRuntime`。
+3. 在 `BackendCapabilities` 声明相同 feature。Registry 注册时会校验声明
+   与 capability accessor 一致，启动阶段即可发现适配错误。
+4. 只在 `app/bootstrap.rs` 注册 concrete adapter；core 和已有命令不依赖
+   backend 类型。实现 `DebugRuntime` 的 GDB remote backend 可直接复用
+   `asbx debug`，无需增加 backend 名称分支或解析私有 metadata。
+
+`--backend` 直接解析开放式 `BackendId`，不维护 CLI backend 枚举；因此新增
+backend 不需要修改 Clap 参数模型。
+
+backend-facing 的 boot source、feature 和 debug protocol 枚举标记为
+`non_exhaustive`；既有 adapter 对未来 root source 返回 `Unsupported`，而不是
+因为新增枚举成员被迫同步改造。Snapshot store 和 image-cache store 也可独立
+配置，backend 不需要为了承担其中一种角色而伪造另一种 capability。
 
 ## 12. 状态与目录
 

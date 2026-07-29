@@ -5,6 +5,7 @@
 use std::{
     collections::BTreeMap,
     fmt,
+    net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
     time::Duration,
@@ -118,6 +119,7 @@ impl FromStr for BackendId {
 /// A boot-source family accepted by a runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum BootSourceKind {
     /// OCI image reference.
     OciImage,
@@ -132,6 +134,7 @@ pub enum BootSourceKind {
 /// Independently discoverable runtime operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum RuntimeFeature {
     /// Stream non-interactive guest commands.
     Exec,
@@ -280,6 +283,7 @@ pub enum SecurityMode {
 /// Root filesystem source.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum RootSource {
     /// An OCI image reference.
     Image(String),
@@ -344,6 +348,45 @@ pub struct MachineDebugSpec {
     pub gdb_port: u16,
     /// Start CPUs paused until a debugger or machine-control client resumes them.
     pub pause_at_boot: bool,
+}
+
+/// Remote debugger protocol exposed by a runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum DebugProtocol {
+    /// GDB remote serial protocol over TCP.
+    GdbRemote,
+}
+
+/// Typed debugger connection context supplied by a runtime capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugContext {
+    /// Runtime backend that owns the target.
+    pub backend: BackendId,
+    /// Remote debugging protocol.
+    pub protocol: DebugProtocol,
+    /// Host endpoint. Agent-facing consumers should normally require loopback.
+    pub endpoint: SocketAddr,
+    /// Guest architecture.
+    pub architecture: String,
+    /// Selected accelerator when applicable.
+    pub accelerator: Option<String>,
+    /// Current runtime status.
+    pub status: String,
+    /// Whether the guest was intentionally paused before its first instruction.
+    pub paused_at_boot: Option<bool>,
+    /// Whether address randomization is known to be disabled.
+    pub kaslr_disabled: Option<bool>,
+    /// Boot executable reported for context only; consumers must not load it implicitly.
+    pub boot_kernel: Option<PathBuf>,
+}
+
+impl DebugContext {
+    /// Whether runtime state still owns live VM resources.
+    pub fn is_active(&self) -> bool {
+        !matches!(self.status.as_str(), "created" | "stopped" | "crashed")
+    }
 }
 
 /// A loopback TCP port publication.
@@ -538,24 +581,23 @@ pub struct GuestEntry {
 // Traits
 //--------------------------------------------------------------------------------------------------
 
-/// Pluggable microVM runtime used by the core orchestration layer.
+/// Streams non-interactive commands in a running sandbox.
 #[async_trait]
-pub trait SandboxRuntime: Send + Sync {
-    /// Stable backend identifier.
-    fn backend_id(&self) -> BackendId;
-
-    /// Static backend capabilities.
-    fn capabilities(&self) -> BackendCapabilities;
-
-    /// Create and start a sandbox.
-    async fn create(&self, spec: &CreateSpec) -> Result<SandboxInfo>;
-
+pub trait CommandRuntime: Send + Sync {
     /// Stream a command in a running sandbox.
     async fn exec_stream(&self, sandbox: &str, request: ExecRequest) -> Result<ExecStream>;
+}
 
+/// Attaches an interactive terminal to a running sandbox.
+#[async_trait]
+pub trait TerminalRuntime: Send + Sync {
     /// Attach the current terminal to a command.
     async fn attach(&self, sandbox: &str, request: ExecRequest) -> Result<i32>;
+}
 
+/// Transfers files between the host and a running sandbox.
+#[async_trait]
+pub trait FileTransferRuntime: Send + Sync {
     /// Create a guest directory and its parents.
     async fn mkdir(&self, sandbox: &str, guest_path: &str) -> Result<()>;
 
@@ -579,6 +621,92 @@ pub trait SandboxRuntime: Send + Sync {
 
     /// Download one regular guest file.
     async fn get_file(&self, sandbox: &str, guest_path: &str, host_path: &Path) -> Result<()>;
+}
+
+/// Creates and manages reusable runtime snapshots.
+#[async_trait]
+pub trait SnapshotRuntime: Send + Sync {
+    /// Create a disk snapshot from a stopped sandbox.
+    async fn create_snapshot(
+        &self,
+        name: &str,
+        sandbox: &str,
+        labels: &BTreeMap<String, String>,
+    ) -> Result<SnapshotInfo>;
+
+    /// List runtime snapshots.
+    async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>>;
+
+    /// Inspect one runtime snapshot.
+    async fn inspect_snapshot(&self, name: &str) -> Result<SnapshotInfo>;
+
+    /// Remove one runtime snapshot.
+    async fn remove_snapshot(&self, name: &str) -> Result<()>;
+}
+
+/// Inspects and prunes a runtime's image cache.
+#[async_trait]
+pub trait ImageRuntime: Send + Sync {
+    /// List cached OCI image references.
+    async fn list_images(&self) -> Result<Vec<ImageInfo>>;
+
+    /// Remove one cached OCI image reference if unused.
+    async fn remove_image(&self, reference: &str) -> Result<()>;
+}
+
+/// Supplies a typed remote-debugging context for a running sandbox.
+#[async_trait]
+pub trait DebugRuntime: Send + Sync {
+    /// Resolve the current debugger endpoint and target properties.
+    async fn debug_context(&self, sandbox: &str) -> Result<DebugContext>;
+}
+
+/// Pluggable sandbox lifecycle with optional, independently implemented
+/// capabilities.
+///
+/// New backends implement this small lifecycle contract and opt into only the
+/// operation traits they actually support. Adding a new optional operation does
+/// not force unrelated backends to add placeholder methods.
+#[async_trait]
+pub trait SandboxRuntime: Send + Sync {
+    /// Stable backend identifier.
+    fn backend_id(&self) -> BackendId;
+
+    /// Static backend capabilities.
+    fn capabilities(&self) -> BackendCapabilities;
+
+    /// Non-interactive command capability, when supported.
+    fn command_runtime(&self) -> Option<&dyn CommandRuntime> {
+        None
+    }
+
+    /// Interactive terminal capability, when supported.
+    fn terminal_runtime(&self) -> Option<&dyn TerminalRuntime> {
+        None
+    }
+
+    /// Guest file-transfer capability, when supported.
+    fn file_transfer_runtime(&self) -> Option<&dyn FileTransferRuntime> {
+        None
+    }
+
+    /// Snapshot-store capability, when supported.
+    fn snapshot_runtime(&self) -> Option<&dyn SnapshotRuntime> {
+        None
+    }
+
+    /// Image-cache capability, when supported.
+    fn image_runtime(&self) -> Option<&dyn ImageRuntime> {
+        None
+    }
+
+    /// Remote-debugging capability, when supported.
+    fn debug_runtime(&self) -> Option<&dyn DebugRuntime> {
+        None
+    }
+
+    /// Create and start a sandbox.
+    async fn create(&self, spec: &CreateSpec) -> Result<SandboxInfo>;
 
     /// Gracefully stop a sandbox, escalating when necessary.
     async fn stop(&self, sandbox: &str) -> Result<()>;
@@ -597,27 +725,49 @@ pub trait SandboxRuntime: Send + Sync {
 
     /// Check whether runtime prerequisites are ready.
     async fn doctor(&self) -> Result<Vec<(String, bool, String)>>;
+}
 
-    /// Create a disk snapshot from a stopped sandbox.
-    async fn create_snapshot(
-        &self,
-        name: &str,
-        sandbox: &str,
-        labels: &BTreeMap<String, String>,
-    ) -> Result<SnapshotInfo>;
+impl dyn SandboxRuntime {
+    /// Return the command capability or a backend-specific unsupported error.
+    pub fn require_command_runtime(&self) -> Result<&dyn CommandRuntime> {
+        self.command_runtime()
+            .ok_or_else(|| self.unsupported(RuntimeFeature::Exec))
+    }
 
-    /// List runtime snapshots.
-    async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>>;
+    /// Return the terminal capability or a backend-specific unsupported error.
+    pub fn require_terminal_runtime(&self) -> Result<&dyn TerminalRuntime> {
+        self.terminal_runtime()
+            .ok_or_else(|| self.unsupported(RuntimeFeature::Attach))
+    }
 
-    /// Inspect one runtime snapshot.
-    async fn inspect_snapshot(&self, name: &str) -> Result<SnapshotInfo>;
+    /// Return the file-transfer capability or a backend-specific unsupported error.
+    pub fn require_file_transfer_runtime(&self) -> Result<&dyn FileTransferRuntime> {
+        self.file_transfer_runtime()
+            .ok_or_else(|| self.unsupported(RuntimeFeature::FileTransfer))
+    }
 
-    /// Remove one runtime snapshot.
-    async fn remove_snapshot(&self, name: &str) -> Result<()>;
+    /// Return the snapshot capability or a backend-specific unsupported error.
+    pub fn require_snapshot_runtime(&self) -> Result<&dyn SnapshotRuntime> {
+        self.snapshot_runtime()
+            .ok_or_else(|| self.unsupported(RuntimeFeature::Snapshots))
+    }
 
-    /// List cached OCI image references.
-    async fn list_images(&self) -> Result<Vec<ImageInfo>>;
+    /// Return the image-cache capability or a backend-specific unsupported error.
+    pub fn require_image_runtime(&self) -> Result<&dyn ImageRuntime> {
+        self.image_runtime()
+            .ok_or_else(|| self.unsupported(RuntimeFeature::ImageCache))
+    }
 
-    /// Remove one cached OCI image reference if unused.
-    async fn remove_image(&self, reference: &str) -> Result<()>;
+    /// Return the remote-debugging capability or a backend-specific unsupported error.
+    pub fn require_debug_runtime(&self) -> Result<&dyn DebugRuntime> {
+        self.debug_runtime()
+            .ok_or_else(|| self.unsupported(RuntimeFeature::GdbStub))
+    }
+
+    fn unsupported(&self, feature: RuntimeFeature) -> RuntimeError {
+        RuntimeError::Unsupported(format!(
+            "backend {} does not support {feature:?}",
+            self.backend_id()
+        ))
+    }
 }

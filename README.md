@@ -10,6 +10,12 @@ Guest output is streamed through bounded queues; retained JSON tails and
 artifacts are capped by host configuration. Cross-process SQLite reservations
 enforce both global VM count and reserved-memory ceilings.
 
+Backends implement a small lifecycle contract and opt into independent command,
+terminal, file-transfer, snapshot, image-cache, and remote-debug capabilities.
+Registry validation rejects a backend whose declared features do not match its
+implemented capabilities, so adding an unrelated feature does not require
+placeholder changes in every adapter.
+
 Copy mode respects project `.gitignore` and `.agent-sandbox-ignore` files,
 rejects escaping symlinks, and constructs guest paths with POSIX semantics on
 Linux, macOS, and Windows hosts.

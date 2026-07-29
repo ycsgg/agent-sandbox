@@ -1,4 +1,4 @@
-//! Runtime backend registry and sandbox-operation routing.
+//! Runtime backend registry, capability validation, and operation routing.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -9,48 +9,80 @@ use std::{
 use async_trait::async_trait;
 
 use crate::{
-    BackendCapabilities, BackendId, CreateSpec, ExecRequest, ExecStream, GuestEntry, ImageInfo,
-    Result, RuntimeError, SandboxInfo, SandboxRuntime, SnapshotInfo,
+    BackendCapabilities, BackendId, CommandRuntime, CreateSpec, DebugContext, DebugRuntime,
+    ExecRequest, ExecStream, FileTransferRuntime, GuestEntry, ImageInfo, ImageRuntime, Result,
+    RuntimeError, RuntimeFeature, SandboxInfo, SandboxRuntime, SnapshotInfo, SnapshotRuntime,
+    TerminalRuntime,
 };
 
 /// A runtime facade that selects a backend at creation time and routes later
 /// operations from the backend namespace embedded in sandbox IDs.
 pub struct RuntimeRegistry {
     default_backend: BackendId,
-    storage_backend: BackendId,
+    snapshot_backend: Option<BackendId>,
+    image_backend: Option<BackendId>,
     backends: BTreeMap<BackendId, Arc<dyn SandboxRuntime>>,
 }
 
 impl RuntimeRegistry {
-    /// Create an empty registry.
-    pub fn new(default_backend: BackendId, storage_backend: BackendId) -> Self {
+    /// Create an empty registry without a snapshot/image storage backend.
+    pub fn new(default_backend: BackendId) -> Self {
         Self {
             default_backend,
-            storage_backend,
+            snapshot_backend: None,
+            image_backend: None,
             backends: BTreeMap::new(),
         }
     }
 
-    /// Register one backend, rejecting duplicate identifiers.
+    /// Select one backend for both snapshot and image-cache operations.
+    pub fn with_storage_backend(mut self, backend: BackendId) -> Self {
+        self.snapshot_backend = Some(backend.clone());
+        self.image_backend = Some(backend);
+        self
+    }
+
+    /// Select the backend used for global snapshot operations.
+    pub fn with_snapshot_backend(mut self, backend: BackendId) -> Self {
+        self.snapshot_backend = Some(backend);
+        self
+    }
+
+    /// Select the backend used for global image-cache operations.
+    pub fn with_image_backend(mut self, backend: BackendId) -> Self {
+        self.image_backend = Some(backend);
+        self
+    }
+
+    /// Register one backend after validating its capability declaration.
     pub fn register(&mut self, runtime: Arc<dyn SandboxRuntime>) -> Result<()> {
+        validate_runtime_contract(runtime.as_ref())?;
         let backend = runtime.backend_id();
-        if self.backends.insert(backend.clone(), runtime).is_some() {
+        if self.backends.contains_key(&backend) {
             return Err(RuntimeError::Configuration(format!(
                 "backend {backend:?} was registered more than once"
             )));
         }
+        self.backends.insert(backend, runtime);
         Ok(())
     }
 
-    /// Validate that the configured default and storage backends exist.
+    /// Validate configured backend roles after registration is complete.
     pub fn validate(&self) -> Result<()> {
-        for (role, backend) in [
-            ("default", &self.default_backend),
-            ("storage", &self.storage_backend),
-        ] {
-            if !self.backends.contains_key(backend) {
+        self.backend(&self.default_backend)?;
+        if let Some(snapshot_backend) = &self.snapshot_backend {
+            let storage = self.backend(snapshot_backend)?;
+            if storage.snapshot_runtime().is_none() {
                 return Err(RuntimeError::Configuration(format!(
-                    "{role} backend {backend:?} is not registered"
+                    "snapshot backend {snapshot_backend} does not provide snapshot capability"
+                )));
+            }
+        }
+        if let Some(image_backend) = &self.image_backend {
+            let storage = self.backend(image_backend)?;
+            if storage.image_runtime().is_none() {
+                return Err(RuntimeError::Configuration(format!(
+                    "image backend {image_backend} does not provide image-cache capability"
                 )));
             }
         }
@@ -101,8 +133,18 @@ impl RuntimeRegistry {
         Err(RuntimeError::NotFound(sandbox.into()))
     }
 
-    fn storage(&self) -> Result<Arc<dyn SandboxRuntime>> {
-        self.backend(&self.storage_backend)
+    fn snapshot_storage(&self) -> Result<Arc<dyn SandboxRuntime>> {
+        let backend = self.snapshot_backend.as_ref().ok_or_else(|| {
+            RuntimeError::Unsupported("no snapshot storage backend is configured".into())
+        })?;
+        self.backend(backend)
+    }
+
+    fn image_storage(&self) -> Result<Arc<dyn SandboxRuntime>> {
+        let backend = self.image_backend.as_ref().ok_or_else(|| {
+            RuntimeError::Unsupported("no image-cache backend is configured".into())
+        })?;
+        self.backend(backend)
     }
 }
 
@@ -132,70 +174,52 @@ impl SandboxRuntime for RuntimeRegistry {
         }
     }
 
+    fn command_runtime(&self) -> Option<&dyn CommandRuntime> {
+        self.backends
+            .values()
+            .any(|backend| backend.command_runtime().is_some())
+            .then_some(self)
+    }
+
+    fn terminal_runtime(&self) -> Option<&dyn TerminalRuntime> {
+        self.backends
+            .values()
+            .any(|backend| backend.terminal_runtime().is_some())
+            .then_some(self)
+    }
+
+    fn file_transfer_runtime(&self) -> Option<&dyn FileTransferRuntime> {
+        self.backends
+            .values()
+            .any(|backend| backend.file_transfer_runtime().is_some())
+            .then_some(self)
+    }
+
+    fn snapshot_runtime(&self) -> Option<&dyn SnapshotRuntime> {
+        self.snapshot_backend
+            .as_ref()
+            .and_then(|backend| self.backends.get(backend))
+            .and_then(|backend| backend.snapshot_runtime())
+            .map(|_| self as &dyn SnapshotRuntime)
+    }
+
+    fn image_runtime(&self) -> Option<&dyn ImageRuntime> {
+        self.image_backend
+            .as_ref()
+            .and_then(|backend| self.backends.get(backend))
+            .and_then(|backend| backend.image_runtime())
+            .map(|_| self as &dyn ImageRuntime)
+    }
+
+    fn debug_runtime(&self) -> Option<&dyn DebugRuntime> {
+        self.backends
+            .values()
+            .any(|backend| backend.debug_runtime().is_some())
+            .then_some(self)
+    }
+
     async fn create(&self, spec: &CreateSpec) -> Result<SandboxInfo> {
         self.backend(&spec.backend)?.create(spec).await
-    }
-
-    async fn exec_stream(&self, sandbox: &str, request: ExecRequest) -> Result<ExecStream> {
-        self.backend_for_sandbox(sandbox)
-            .await?
-            .exec_stream(sandbox, request)
-            .await
-    }
-
-    async fn attach(&self, sandbox: &str, request: ExecRequest) -> Result<i32> {
-        self.backend_for_sandbox(sandbox)
-            .await?
-            .attach(sandbox, request)
-            .await
-    }
-
-    async fn mkdir(&self, sandbox: &str, guest_path: &str) -> Result<()> {
-        self.backend_for_sandbox(sandbox)
-            .await?
-            .mkdir(sandbox, guest_path)
-            .await
-    }
-
-    async fn put_file(
-        &self,
-        sandbox: &str,
-        host_path: &Path,
-        guest_path: &str,
-        mode: u32,
-    ) -> Result<()> {
-        self.backend_for_sandbox(sandbox)
-            .await?
-            .put_file(sandbox, host_path, guest_path, mode)
-            .await
-    }
-
-    async fn symlink(&self, sandbox: &str, target: &str, guest_path: &str) -> Result<()> {
-        self.backend_for_sandbox(sandbox)
-            .await?
-            .symlink(sandbox, target, guest_path)
-            .await
-    }
-
-    async fn set_mode(&self, sandbox: &str, guest_path: &str, mode: u32) -> Result<()> {
-        self.backend_for_sandbox(sandbox)
-            .await?
-            .set_mode(sandbox, guest_path, mode)
-            .await
-    }
-
-    async fn list_dir(&self, sandbox: &str, guest_path: &str) -> Result<Vec<GuestEntry>> {
-        self.backend_for_sandbox(sandbox)
-            .await?
-            .list_dir(sandbox, guest_path)
-            .await
-    }
-
-    async fn get_file(&self, sandbox: &str, guest_path: &str, host_path: &Path) -> Result<()> {
-        self.backend_for_sandbox(sandbox)
-            .await?
-            .get_file(sandbox, guest_path, host_path)
-            .await
     }
 
     async fn stop(&self, sandbox: &str) -> Result<()> {
@@ -232,36 +256,323 @@ impl SandboxRuntime for RuntimeRegistry {
     async fn doctor(&self) -> Result<Vec<(String, bool, String)>> {
         self.backend(&self.default_backend)?.doctor().await
     }
+}
 
+#[async_trait]
+impl CommandRuntime for RuntimeRegistry {
+    async fn exec_stream(&self, sandbox: &str, request: ExecRequest) -> Result<ExecStream> {
+        let backend = self.backend_for_sandbox(sandbox).await?;
+        let capability = backend
+            .command_runtime()
+            .ok_or_else(|| unsupported_capability(&backend.backend_id(), RuntimeFeature::Exec))?;
+        capability.exec_stream(sandbox, request).await
+    }
+}
+
+#[async_trait]
+impl TerminalRuntime for RuntimeRegistry {
+    async fn attach(&self, sandbox: &str, request: ExecRequest) -> Result<i32> {
+        let backend = self.backend_for_sandbox(sandbox).await?;
+        let capability = backend
+            .terminal_runtime()
+            .ok_or_else(|| unsupported_capability(&backend.backend_id(), RuntimeFeature::Attach))?;
+        capability.attach(sandbox, request).await
+    }
+}
+
+#[async_trait]
+impl FileTransferRuntime for RuntimeRegistry {
+    async fn mkdir(&self, sandbox: &str, guest_path: &str) -> Result<()> {
+        let backend = self.backend_for_sandbox(sandbox).await?;
+        transfer(&backend)?.mkdir(sandbox, guest_path).await
+    }
+
+    async fn put_file(
+        &self,
+        sandbox: &str,
+        host_path: &Path,
+        guest_path: &str,
+        mode: u32,
+    ) -> Result<()> {
+        let backend = self.backend_for_sandbox(sandbox).await?;
+        transfer(&backend)?
+            .put_file(sandbox, host_path, guest_path, mode)
+            .await
+    }
+
+    async fn symlink(&self, sandbox: &str, target: &str, guest_path: &str) -> Result<()> {
+        let backend = self.backend_for_sandbox(sandbox).await?;
+        transfer(&backend)?
+            .symlink(sandbox, target, guest_path)
+            .await
+    }
+
+    async fn set_mode(&self, sandbox: &str, guest_path: &str, mode: u32) -> Result<()> {
+        let backend = self.backend_for_sandbox(sandbox).await?;
+        transfer(&backend)?
+            .set_mode(sandbox, guest_path, mode)
+            .await
+    }
+
+    async fn list_dir(&self, sandbox: &str, guest_path: &str) -> Result<Vec<GuestEntry>> {
+        let backend = self.backend_for_sandbox(sandbox).await?;
+        transfer(&backend)?.list_dir(sandbox, guest_path).await
+    }
+
+    async fn get_file(&self, sandbox: &str, guest_path: &str, host_path: &Path) -> Result<()> {
+        let backend = self.backend_for_sandbox(sandbox).await?;
+        transfer(&backend)?
+            .get_file(sandbox, guest_path, host_path)
+            .await
+    }
+}
+
+#[async_trait]
+impl SnapshotRuntime for RuntimeRegistry {
     async fn create_snapshot(
         &self,
         name: &str,
         sandbox: &str,
         labels: &BTreeMap<String, String>,
     ) -> Result<SnapshotInfo> {
-        self.backend_for_sandbox(sandbox)
-            .await?
-            .create_snapshot(name, sandbox, labels)
-            .await
+        let backend = self.backend_for_sandbox(sandbox).await?;
+        let capability = backend.snapshot_runtime().ok_or_else(|| {
+            unsupported_capability(&backend.backend_id(), RuntimeFeature::Snapshots)
+        })?;
+        capability.create_snapshot(name, sandbox, labels).await
     }
 
     async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
-        self.storage()?.list_snapshots().await
+        let backend = self.snapshot_storage()?;
+        storage_snapshots(&backend)?.list_snapshots().await
     }
 
     async fn inspect_snapshot(&self, name: &str) -> Result<SnapshotInfo> {
-        self.storage()?.inspect_snapshot(name).await
+        let backend = self.snapshot_storage()?;
+        storage_snapshots(&backend)?.inspect_snapshot(name).await
     }
 
     async fn remove_snapshot(&self, name: &str) -> Result<()> {
-        self.storage()?.remove_snapshot(name).await
+        let backend = self.snapshot_storage()?;
+        storage_snapshots(&backend)?.remove_snapshot(name).await
     }
+}
 
+#[async_trait]
+impl ImageRuntime for RuntimeRegistry {
     async fn list_images(&self) -> Result<Vec<ImageInfo>> {
-        self.storage()?.list_images().await
+        let backend = self.image_storage()?;
+        storage_images(&backend)?.list_images().await
     }
 
     async fn remove_image(&self, reference: &str) -> Result<()> {
-        self.storage()?.remove_image(reference).await
+        let backend = self.image_storage()?;
+        storage_images(&backend)?.remove_image(reference).await
+    }
+}
+
+#[async_trait]
+impl DebugRuntime for RuntimeRegistry {
+    async fn debug_context(&self, sandbox: &str) -> Result<DebugContext> {
+        let backend = self.backend_for_sandbox(sandbox).await?;
+        let capability = backend.debug_runtime().ok_or_else(|| {
+            unsupported_capability(&backend.backend_id(), RuntimeFeature::GdbStub)
+        })?;
+        capability.debug_context(sandbox).await
+    }
+}
+
+fn transfer(runtime: &Arc<dyn SandboxRuntime>) -> Result<&dyn FileTransferRuntime> {
+    runtime
+        .file_transfer_runtime()
+        .ok_or_else(|| unsupported_capability(&runtime.backend_id(), RuntimeFeature::FileTransfer))
+}
+
+fn storage_snapshots(runtime: &Arc<dyn SandboxRuntime>) -> Result<&dyn SnapshotRuntime> {
+    runtime
+        .snapshot_runtime()
+        .ok_or_else(|| unsupported_capability(&runtime.backend_id(), RuntimeFeature::Snapshots))
+}
+
+fn storage_images(runtime: &Arc<dyn SandboxRuntime>) -> Result<&dyn ImageRuntime> {
+    runtime
+        .image_runtime()
+        .ok_or_else(|| unsupported_capability(&runtime.backend_id(), RuntimeFeature::ImageCache))
+}
+
+fn unsupported_capability(backend: &BackendId, feature: RuntimeFeature) -> RuntimeError {
+    RuntimeError::Unsupported(format!("backend {backend} does not support {feature:?}"))
+}
+
+fn validate_runtime_contract(runtime: &dyn SandboxRuntime) -> Result<()> {
+    let backend = runtime.backend_id();
+    let capabilities = runtime.capabilities();
+    if capabilities.backend != backend {
+        return Err(RuntimeError::Configuration(format!(
+            "backend {backend} returned a capability descriptor for {}",
+            capabilities.backend
+        )));
+    }
+
+    let features: BTreeSet<_> = capabilities.features.iter().copied().collect();
+    if features.len() != capabilities.features.len() {
+        return Err(RuntimeError::Configuration(format!(
+            "backend {backend} declares duplicate runtime features"
+        )));
+    }
+
+    for (feature, implemented) in [
+        (RuntimeFeature::Exec, runtime.command_runtime().is_some()),
+        (RuntimeFeature::Attach, runtime.terminal_runtime().is_some()),
+        (
+            RuntimeFeature::FileTransfer,
+            runtime.file_transfer_runtime().is_some(),
+        ),
+        (
+            RuntimeFeature::Snapshots,
+            runtime.snapshot_runtime().is_some(),
+        ),
+        (
+            RuntimeFeature::ImageCache,
+            runtime.image_runtime().is_some(),
+        ),
+        (RuntimeFeature::GdbStub, runtime.debug_runtime().is_some()),
+    ] {
+        if features.contains(&feature) != implemented {
+            return Err(RuntimeError::Configuration(format!(
+                "backend {backend} capability mismatch for {feature:?}: descriptor={}, implementation={implemented}",
+                features.contains(&feature)
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MinimalRuntime {
+        features: Vec<RuntimeFeature>,
+    }
+
+    #[async_trait]
+    impl SandboxRuntime for MinimalRuntime {
+        fn backend_id(&self) -> BackendId {
+            BackendId::new("minimal").unwrap()
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                backend: self.backend_id(),
+                boot_sources: vec![],
+                features: self.features.clone(),
+                architectures: vec![],
+                accelerators: vec![],
+            }
+        }
+
+        fn snapshot_runtime(&self) -> Option<&dyn SnapshotRuntime> {
+            self.features
+                .contains(&RuntimeFeature::Snapshots)
+                .then_some(self)
+        }
+
+        async fn create(&self, _spec: &CreateSpec) -> Result<SandboxInfo> {
+            Err(RuntimeError::Unsupported("create".into()))
+        }
+
+        async fn stop(&self, _sandbox: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn kill(&self, _sandbox: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn remove(&self, _sandbox: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list(&self) -> Result<Vec<SandboxInfo>> {
+            Ok(vec![])
+        }
+
+        async fn inspect(&self, sandbox: &str) -> Result<SandboxInfo> {
+            Err(RuntimeError::NotFound(sandbox.into()))
+        }
+
+        async fn doctor(&self) -> Result<Vec<(String, bool, String)>> {
+            Ok(vec![])
+        }
+    }
+
+    #[async_trait]
+    impl SnapshotRuntime for MinimalRuntime {
+        async fn create_snapshot(
+            &self,
+            name: &str,
+            _sandbox: &str,
+            labels: &BTreeMap<String, String>,
+        ) -> Result<SnapshotInfo> {
+            Ok(SnapshotInfo {
+                name: name.into(),
+                digest: format!("sha256:{name}"),
+                image: "minimal:latest".into(),
+                image_manifest_digest: "sha256:base".into(),
+                size_bytes: 0,
+                created_at: None,
+                labels: labels.clone(),
+            })
+        }
+
+        async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
+            Ok(vec![])
+        }
+
+        async fn inspect_snapshot(&self, name: &str) -> Result<SnapshotInfo> {
+            Err(RuntimeError::NotFound(name.into()))
+        }
+
+        async fn remove_snapshot(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn lifecycle_only_backend_registers_without_optional_method_stubs() {
+        let backend = BackendId::new("minimal").unwrap();
+        let mut registry = RuntimeRegistry::new(backend);
+        registry
+            .register(Arc::new(MinimalRuntime { features: vec![] }))
+            .unwrap();
+        registry.validate().unwrap();
+    }
+
+    #[test]
+    fn feature_declaration_must_match_implemented_capability() {
+        let backend = BackendId::new("minimal").unwrap();
+        let mut registry = RuntimeRegistry::new(backend);
+        let error = registry
+            .register(Arc::new(MinimalRuntime {
+                features: vec![RuntimeFeature::Exec],
+            }))
+            .unwrap_err();
+        assert!(error.to_string().contains("capability mismatch for Exec"));
+    }
+
+    #[test]
+    fn snapshot_backend_does_not_need_image_capability() {
+        let backend = BackendId::new("minimal").unwrap();
+        let mut registry =
+            RuntimeRegistry::new(backend.clone()).with_snapshot_backend(backend.clone());
+        registry
+            .register(Arc::new(MinimalRuntime {
+                features: vec![RuntimeFeature::Snapshots],
+            }))
+            .unwrap();
+        registry.validate().unwrap();
+        assert!(registry.snapshot_runtime().is_some());
+        assert!(registry.image_runtime().is_none());
     }
 }

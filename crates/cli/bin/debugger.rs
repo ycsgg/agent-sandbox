@@ -1,4 +1,4 @@
-//! Host debugger discovery and attachment for QEMU GDB stubs.
+//! Host debugger discovery and attachment for typed runtime debug contexts.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -10,14 +10,14 @@ use std::{
 };
 
 use agent_sandbox_core::AgentSandbox;
-use agent_sandbox_runtime::BackendId;
+use agent_sandbox_runtime::DebugProtocol;
 use anyhow::{Context, Result, bail};
 use clap::{Args, ValueEnum};
 
 /// Arguments for `asbx debug`.
 #[derive(Debug, Args)]
 pub(crate) struct DebugArgs {
-    /// QEMU sandbox session ID.
+    /// Sandbox session ID exposing a remote-debugging capability.
     pub(crate) id: String,
 
     /// Uncompressed executable with matching symbols, normally `vmlinux`.
@@ -85,7 +85,7 @@ struct DebugPlan {
     warnings: Vec<String>,
 }
 
-/// Resolve and optionally launch a host debugger for one QEMU session.
+/// Resolve and optionally launch a host debugger for one sandbox session.
 pub(crate) async fn run(service: &AgentSandbox, arguments: DebugArgs) -> Result<i32> {
     let plan = build_plan(service, &arguments).await?;
     if arguments.print_command {
@@ -116,58 +116,27 @@ pub(crate) async fn run(service: &AgentSandbox, arguments: DebugArgs) -> Result<
 }
 
 async fn build_plan(service: &AgentSandbox, arguments: &DebugArgs) -> Result<DebugPlan> {
-    let view = service.inspect(&arguments.id).await?;
-    if view.session.backend.as_str() != BackendId::QEMU {
-        bail!(
-            "session {} uses backend {}; debug attach currently requires qemu",
-            arguments.id,
-            view.session.backend
-        );
-    }
-    let runtime = view.runtime.ok_or_else(|| {
-        anyhow::anyhow!(
-            "runtime state for session {} is unavailable; inspect or close the stale session",
-            arguments.id
-        )
-    })?;
-    if !runtime.is_active() {
+    let context = service.debug_context(&arguments.id).await?;
+    if !context.is_active() {
         bail!(
             "session {} is not running (status {})",
             arguments.id,
-            runtime.status
+            context.status
         );
     }
-    let endpoint = runtime
-        .metadata
-        .get("gdb")
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "session {} has no GDB stub; reopen it with --gdb",
-                arguments.id
-            )
-        })
-        .and_then(|value| parse_loopback_endpoint(value))?;
-    let architecture = runtime
-        .metadata
-        .get("architecture")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("QEMU runtime did not report a guest architecture"))?;
-    let accelerator = runtime
-        .metadata
-        .get("accelerator")
-        .cloned()
-        .unwrap_or_else(|| "unknown".into());
+    let endpoint = match context.protocol {
+        DebugProtocol::GdbRemote => validate_loopback_endpoint(context.endpoint)?,
+        protocol => bail!("unsupported remote debugger protocol {protocol:?}"),
+    };
+    let architecture = context.architecture;
+    let accelerator = context.accelerator.unwrap_or_else(|| "unknown".into());
 
     let explicit_symbols = arguments
         .symbols
         .as_deref()
         .map(|path| canonical_file("symbol file", path))
         .transpose()?;
-    let boot_kernel = runtime
-        .metadata
-        .get("kernel")
-        .map(PathBuf::from)
-        .filter(|path| path.is_file());
+    let boot_kernel = context.boot_kernel.filter(|path| path.is_file());
     let symbol_mode = if explicit_symbols.is_some() {
         "symbols"
     } else {
@@ -181,16 +150,10 @@ async fn build_plan(service: &AgentSandbox, arguments: &DebugArgs) -> Result<Deb
         explicit_symbols.is_some(),
         boot_kernel.is_some(),
         &accelerator,
-        runtime
-            .metadata
-            .get("debug_paused_at_boot")
-            .and_then(|value| value.parse::<bool>().ok()),
-        runtime
-            .metadata
-            .get("kaslr_disabled")
-            .and_then(|value| value.parse::<bool>().ok()),
+        context.paused_at_boot,
+        context.kaslr_disabled,
         linux_kernel,
-        &runtime.status,
+        &context.status,
     );
     if let Some(symbols) = &explicit_symbols {
         match detect_architecture(symbols)? {
@@ -227,7 +190,7 @@ async fn build_plan(service: &AgentSandbox, arguments: &DebugArgs) -> Result<Deb
         endpoint,
         architecture,
         accelerator,
-        status: runtime.status,
+        status: context.status,
         symbols: explicit_symbols,
         boot_kernel,
         symbol_mode,
@@ -288,14 +251,7 @@ fn looks_like_linux_kernel(path: &Path) -> bool {
         || name.starts_with("vmlinuz")
 }
 
-fn parse_loopback_endpoint(value: &str) -> Result<SocketAddr> {
-    let endpoint = value
-        .strip_prefix("tcp://")
-        .ok_or_else(|| {
-            anyhow::anyhow!("unsupported GDB endpoint {value:?}; expected tcp://HOST:PORT")
-        })?
-        .parse::<SocketAddr>()
-        .with_context(|| format!("invalid GDB endpoint {value:?}"))?;
+fn validate_loopback_endpoint(endpoint: SocketAddr) -> Result<SocketAddr> {
     if !endpoint.ip().is_loopback() {
         bail!("refusing non-loopback GDB endpoint {endpoint}");
     }
@@ -540,15 +496,14 @@ mod tests {
     #[test]
     fn only_loopback_debug_endpoints_are_accepted() {
         assert_eq!(
-            parse_loopback_endpoint("tcp://127.0.0.1:1234").unwrap(),
+            validate_loopback_endpoint("127.0.0.1:1234".parse().unwrap()).unwrap(),
             "127.0.0.1:1234".parse().unwrap()
         );
         assert_eq!(
-            parse_loopback_endpoint("tcp://[::1]:4321").unwrap(),
+            validate_loopback_endpoint("[::1]:4321".parse().unwrap()).unwrap(),
             "[::1]:4321".parse().unwrap()
         );
-        assert!(parse_loopback_endpoint("tcp://0.0.0.0:1234").is_err());
-        assert!(parse_loopback_endpoint("unix:///tmp/gdb").is_err());
+        assert!(validate_loopback_endpoint("0.0.0.0:1234".parse().unwrap()).is_err());
     }
 
     #[test]

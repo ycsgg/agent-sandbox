@@ -17,9 +17,9 @@ use agent_sandbox_environment::{
 };
 use agent_sandbox_policy::{EffectiveSpec, HostConfig, RequestedSpec};
 use agent_sandbox_runtime::{
-    BackendId, CreateSpec, ExecRequest, ExecStream, ImageInfo, MachineBootSpec, NetworkMode,
-    NetworkRule, NetworkRuleAction, NetworkRuleTarget, PortMapping, ProjectMode, RootSource,
-    SandboxInfo, SandboxRuntime, SecurityMode, WorkspaceSpec,
+    BackendId, CreateSpec, DebugContext, ExecRequest, ExecStream, ImageInfo, MachineBootSpec,
+    NetworkMode, NetworkRule, NetworkRuleAction, NetworkRuleTarget, PortMapping, ProjectMode,
+    RootSource, SandboxInfo, SandboxRuntime, SecurityMode, WorkspaceSpec,
 };
 use agent_sandbox_state::{
     EnvironmentRecord, ReservationRecord, SessionRecord, StateError, StateStore,
@@ -359,7 +359,12 @@ impl AgentSandbox {
                 )));
             }
             if record.cache_key == build.cache_key && !options.force {
-                match self.runtime.inspect_snapshot(&record.snapshot).await {
+                match self
+                    .runtime
+                    .require_snapshot_runtime()?
+                    .inspect_snapshot(&record.snapshot)
+                    .await
+                {
                     Ok(_) => {
                         return Ok(PreparedEnvironment::Cached(
                             self.state.touch_environment(&record.name, Utc::now())?,
@@ -372,7 +377,12 @@ impl AgentSandbox {
                 }
             }
         } else if !options.force && build.base_digest.is_some() {
-            match self.runtime.inspect_snapshot(&build.snapshot).await {
+            match self
+                .runtime
+                .require_snapshot_runtime()?
+                .inspect_snapshot(&build.snapshot)
+                .await
+            {
                 Ok(snapshot)
                     if snapshot.labels.get("asbx.managed").map(String::as_str)
                         == Some("environment")
@@ -477,6 +487,7 @@ impl AgentSandbox {
         };
         let stream = match self
             .runtime
+            .require_command_runtime()?
             .exec_stream(
                 &id,
                 ExecRequest {
@@ -539,9 +550,18 @@ impl AgentSandbox {
             return Err(self.builder_failure(&builder.id, error).await);
         }
         if builder.force {
-            match self.runtime.inspect_snapshot(&builder.build.snapshot).await {
+            match self
+                .runtime
+                .require_snapshot_runtime()?
+                .inspect_snapshot(&builder.build.snapshot)
+                .await
+            {
                 Ok(_) => {
-                    if let Err(error) = self.runtime.remove_snapshot(&builder.build.snapshot).await
+                    if let Err(error) = self
+                        .runtime
+                        .require_snapshot_runtime()?
+                        .remove_snapshot(&builder.build.snapshot)
+                        .await
                     {
                         return Err(self.builder_failure(&builder.id, error).await);
                     }
@@ -552,6 +572,7 @@ impl AgentSandbox {
         }
         let snapshot = match self
             .runtime
+            .require_snapshot_runtime()?
             .create_snapshot(&builder.build.snapshot, &builder.id, &labels)
             .await
         {
@@ -581,7 +602,12 @@ impl AgentSandbox {
         if let Some(previous) = builder.previous
             && previous.snapshot != record.snapshot
         {
-            match self.runtime.remove_snapshot(&previous.snapshot).await {
+            match self
+                .runtime
+                .require_snapshot_runtime()?
+                .remove_snapshot(&previous.snapshot)
+                .await
+            {
                 Ok(()) | Err(agent_sandbox_runtime::RuntimeError::NotFound(_)) => {}
                 Err(error) => {
                     tracing::warn!(
@@ -608,14 +634,22 @@ impl AgentSandbox {
     /// Inspect one reusable managed environment.
     pub async fn inspect_environment(&self, name: &str) -> Result<EnvironmentRecord> {
         let record = self.state.get_environment(name)?;
-        self.runtime.inspect_snapshot(&record.snapshot).await?;
+        self.runtime
+            .require_snapshot_runtime()?
+            .inspect_snapshot(&record.snapshot)
+            .await?;
         Ok(record)
     }
 
     /// Remove one managed environment snapshot and its registry entry.
     pub async fn remove_environment(&self, name: &str) -> Result<()> {
         let record = self.state.get_environment(name)?;
-        match self.runtime.remove_snapshot(&record.snapshot).await {
+        match self
+            .runtime
+            .require_snapshot_runtime()?
+            .remove_snapshot(&record.snapshot)
+            .await
+        {
             Ok(()) | Err(agent_sandbox_runtime::RuntimeError::NotFound(_)) => {}
             Err(error) => return Err(error.into()),
         }
@@ -625,7 +659,7 @@ impl AgentSandbox {
 
     /// Collect logical runtime cache metadata without walking backend internals.
     pub async fn cache_inventory(&self) -> Result<CacheInventory> {
-        let images = self.runtime.list_images().await?;
+        let images = self.runtime.require_image_runtime()?.list_images().await?;
         let environments = self.state.list_environments()?;
         let logical_bytes = images
             .iter()
@@ -657,7 +691,12 @@ impl AgentSandbox {
             .map(|environment| environment.base_digest.clone())
             .filter(|digest| !digest.is_empty())
             .collect::<BTreeSet<_>>();
-        for snapshot in self.runtime.list_snapshots().await? {
+        for snapshot in self
+            .runtime
+            .require_snapshot_runtime()?
+            .list_snapshots()
+            .await?
+        {
             protected_bases.insert(snapshot.image);
             protected_base_digests.insert(snapshot.image_manifest_digest);
         }
@@ -706,6 +745,7 @@ impl AgentSandbox {
                 CacheKind::Environment => self.remove_environment(&entry.key).await,
                 CacheKind::Image => self
                     .runtime
+                    .require_image_runtime()?
                     .remove_image(&entry.key)
                     .await
                     .map_err(CoreError::from),
@@ -746,12 +786,30 @@ impl AgentSandbox {
 
     /// Start a streaming guest command.
     pub async fn exec(&self, id: &str, request: ExecRequest) -> Result<ExecStream> {
-        Ok(self.runtime.exec_stream(id, request).await?)
+        Ok(self
+            .runtime
+            .require_command_runtime()?
+            .exec_stream(id, request)
+            .await?)
     }
 
     /// Attach the current terminal to a guest command.
     pub async fn attach(&self, id: &str, request: ExecRequest) -> Result<i32> {
-        Ok(self.runtime.attach(id, request).await?)
+        Ok(self
+            .runtime
+            .require_terminal_runtime()?
+            .attach(id, request)
+            .await?)
+    }
+
+    /// Resolve a typed remote-debugging context for an open session.
+    pub async fn debug_context(&self, id: &str) -> Result<DebugContext> {
+        self.require_session(id)?;
+        Ok(self
+            .runtime
+            .require_debug_runtime()?
+            .debug_context(id)
+            .await?)
     }
 
     /// Ensure a durable session exists before operating on it.
@@ -904,8 +962,9 @@ impl AgentSandbox {
         let mut pending = VecDeque::from(["/out".to_owned()]);
         let mut artifacts = Vec::new();
         let mut total = 0_u64;
+        let transfer = self.runtime.require_file_transfer_runtime()?;
         while let Some(directory) = pending.pop_front() {
-            for entry in self.runtime.list_dir(id, &directory).await? {
+            for entry in transfer.list_dir(id, &directory).await? {
                 let path = guest_child_path(&directory, &entry.path)?;
                 if entry.symlink {
                     return Err(CoreError::UnsafePath(format!(
@@ -971,7 +1030,10 @@ impl AgentSandbox {
                 destination.display()
             )));
         }
-        self.runtime.get_file(id, guest_path, destination).await?;
+        self.runtime
+            .require_file_transfer_runtime()?
+            .get_file(id, guest_path, destination)
+            .await?;
         Ok(())
     }
 
@@ -1033,7 +1095,10 @@ impl AgentSandbox {
             )
         } else if let Some(name) = named_environment {
             let record = self.state.get_environment(&name)?;
-            self.runtime.inspect_snapshot(&record.snapshot).await?;
+            self.runtime
+                .require_snapshot_runtime()?
+                .inspect_snapshot(&record.snapshot)
+                .await?;
             (
                 ResolvedEnvironment {
                     root: RootSource::Snapshot(record.snapshot.clone()),
@@ -1154,10 +1219,11 @@ impl AgentSandbox {
     }
 
     async fn prepare_workspace(&self, id: &str, plan: Option<&TransferPlan>) -> Result<()> {
+        let transfer = self.runtime.require_file_transfer_runtime()?;
         if plan.is_some() {
-            self.runtime.mkdir(id, "/workspace").await?;
+            transfer.mkdir(id, "/workspace").await?;
         }
-        self.runtime.mkdir(id, "/out").await?;
+        transfer.mkdir(id, "/out").await?;
         let Some(plan) = plan else {
             return Ok(());
         };
@@ -1165,19 +1231,19 @@ impl AgentSandbox {
             match entry {
                 Entry::Directory { path, mode } => {
                     let guest = guest_project_path(path)?;
-                    self.runtime.mkdir(id, &guest).await?;
-                    self.runtime.set_mode(id, &guest, *mode).await?;
+                    transfer.mkdir(id, &guest).await?;
+                    transfer.set_mode(id, &guest, *mode).await?;
                 }
                 Entry::File {
                     path, source, mode, ..
                 } => {
-                    self.runtime
+                    transfer
                         .put_file(id, source, &guest_project_path(path)?, *mode)
                         .await?;
                 }
                 Entry::Symlink { path, target } => {
                     let target = guest_symlink_target(path, target)?;
-                    self.runtime
+                    transfer
                         .symlink(id, &target, &guest_project_path(path)?)
                         .await?;
                 }
@@ -1220,6 +1286,7 @@ impl AgentSandbox {
     async fn cached_image_digest(&self, reference: &str) -> Result<Option<String>> {
         Ok(self
             .runtime
+            .require_image_runtime()?
             .list_images()
             .await?
             .into_iter()
@@ -1452,6 +1519,7 @@ fn root_description(resolved: &ResolvedEnvironment) -> String {
                 })
                 .unwrap_or_else(|| "unconfigured".into())
         ),
+        _ => "backend-defined".into(),
     }
 }
 
@@ -1467,8 +1535,9 @@ mod tests {
     };
 
     use agent_sandbox_runtime::{
-        BackendCapabilities, BootSourceKind, ExecEvent, GuestEntry, ImageInfo,
-        Result as RuntimeResult, RuntimeError, RuntimeFeature, SandboxRuntime, SnapshotInfo,
+        BackendCapabilities, BootSourceKind, CommandRuntime, ExecEvent, FileTransferRuntime,
+        GuestEntry, ImageInfo, ImageRuntime, Result as RuntimeResult, RuntimeError, RuntimeFeature,
+        SandboxRuntime, SnapshotInfo, SnapshotRuntime, TerminalRuntime,
     };
     use async_trait::async_trait;
     use tempfile::tempdir;
@@ -1503,10 +1572,36 @@ mod tests {
             BackendCapabilities {
                 backend: self.backend_id(),
                 boot_sources: vec![BootSourceKind::OciImage],
-                features: vec![RuntimeFeature::Exec],
+                features: vec![
+                    RuntimeFeature::Exec,
+                    RuntimeFeature::Attach,
+                    RuntimeFeature::FileTransfer,
+                    RuntimeFeature::Snapshots,
+                    RuntimeFeature::ImageCache,
+                ],
                 architectures: vec![],
                 accelerators: vec![],
             }
+        }
+
+        fn command_runtime(&self) -> Option<&dyn CommandRuntime> {
+            Some(self)
+        }
+
+        fn terminal_runtime(&self) -> Option<&dyn TerminalRuntime> {
+            Some(self)
+        }
+
+        fn file_transfer_runtime(&self) -> Option<&dyn FileTransferRuntime> {
+            Some(self)
+        }
+
+        fn snapshot_runtime(&self) -> Option<&dyn SnapshotRuntime> {
+            Some(self)
+        }
+
+        fn image_runtime(&self) -> Option<&dyn ImageRuntime> {
+            Some(self)
         }
 
         async fn create(&self, spec: &CreateSpec) -> RuntimeResult<SandboxInfo> {
@@ -1517,6 +1612,33 @@ mod tests {
             Ok(info(&spec.id))
         }
 
+        async fn stop(&self, sandbox: &str) -> RuntimeResult<()> {
+            self.stop_impl(sandbox).await
+        }
+
+        async fn kill(&self, sandbox: &str) -> RuntimeResult<()> {
+            self.kill_impl(sandbox).await
+        }
+
+        async fn remove(&self, sandbox: &str) -> RuntimeResult<()> {
+            self.remove_impl(sandbox).await
+        }
+
+        async fn list(&self) -> RuntimeResult<Vec<SandboxInfo>> {
+            self.list_impl().await
+        }
+
+        async fn inspect(&self, sandbox: &str) -> RuntimeResult<SandboxInfo> {
+            self.inspect_impl(sandbox).await
+        }
+
+        async fn doctor(&self) -> RuntimeResult<Vec<(String, bool, String)>> {
+            self.doctor_impl().await
+        }
+    }
+
+    #[async_trait]
+    impl CommandRuntime for MockRuntime {
         async fn exec_stream(
             &self,
             _sandbox: &str,
@@ -1529,11 +1651,17 @@ mod tests {
                 .unwrap();
             Ok(receiver)
         }
+    }
 
+    #[async_trait]
+    impl TerminalRuntime for MockRuntime {
         async fn attach(&self, _sandbox: &str, _request: ExecRequest) -> RuntimeResult<i32> {
             Ok(0)
         }
+    }
 
+    #[async_trait]
+    impl FileTransferRuntime for MockRuntime {
         async fn mkdir(&self, _sandbox: &str, guest_path: &str) -> RuntimeResult<()> {
             self.state
                 .lock()
@@ -1588,29 +1716,31 @@ mod tests {
         ) -> RuntimeResult<()> {
             Ok(())
         }
+    }
 
-        async fn stop(&self, _sandbox: &str) -> RuntimeResult<()> {
+    impl MockRuntime {
+        async fn stop_impl(&self, _sandbox: &str) -> RuntimeResult<()> {
             self.state.lock().unwrap().operations.push("stop".into());
             Ok(())
         }
 
-        async fn kill(&self, _sandbox: &str) -> RuntimeResult<()> {
+        async fn kill_impl(&self, _sandbox: &str) -> RuntimeResult<()> {
             self.state.lock().unwrap().operations.push("kill".into());
             Ok(())
         }
 
-        async fn remove(&self, _sandbox: &str) -> RuntimeResult<()> {
+        async fn remove_impl(&self, _sandbox: &str) -> RuntimeResult<()> {
             let mut state = self.state.lock().unwrap();
             state.operations.push("remove".into());
             state.existing = false;
             Ok(())
         }
 
-        async fn list(&self) -> RuntimeResult<Vec<SandboxInfo>> {
+        async fn list_impl(&self) -> RuntimeResult<Vec<SandboxInfo>> {
             Ok(vec![])
         }
 
-        async fn inspect(&self, sandbox: &str) -> RuntimeResult<SandboxInfo> {
+        async fn inspect_impl(&self, sandbox: &str) -> RuntimeResult<SandboxInfo> {
             let state = self.state.lock().unwrap();
             if state.inspect_error {
                 Err(RuntimeError::Backend {
@@ -1624,10 +1754,13 @@ mod tests {
             }
         }
 
-        async fn doctor(&self) -> RuntimeResult<Vec<(String, bool, String)>> {
+        async fn doctor_impl(&self) -> RuntimeResult<Vec<(String, bool, String)>> {
             Ok(vec![("mock".into(), true, "ready".into())])
         }
+    }
 
+    #[async_trait]
+    impl SnapshotRuntime for MockRuntime {
         async fn create_snapshot(
             &self,
             name: &str,
@@ -1676,7 +1809,10 @@ mod tests {
             self.state.lock().unwrap().snapshots.remove(name);
             Ok(())
         }
+    }
 
+    #[async_trait]
+    impl ImageRuntime for MockRuntime {
         async fn list_images(&self) -> RuntimeResult<Vec<ImageInfo>> {
             let state = self.state.lock().unwrap();
             if !state.images.is_empty() {

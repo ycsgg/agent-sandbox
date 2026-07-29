@@ -12,9 +12,10 @@ use std::{
 };
 
 use agent_sandbox_runtime::{
-    BackendCapabilities, BackendId, BootSourceKind, CreateSpec, ExecEvent, ExecRequest, ExecStream,
-    GuestEntry, ImageInfo, OutputStream, Result, RuntimeError, RuntimeFeature, SandboxInfo,
-    SandboxRuntime, SnapshotInfo, WorkspaceSpec,
+    BackendCapabilities, BackendId, BootSourceKind, CommandRuntime, CreateSpec, DebugContext,
+    DebugProtocol, DebugRuntime, ExecEvent, ExecRequest, ExecStream, FileTransferRuntime,
+    GuestEntry, OutputStream, Result, RuntimeError, RuntimeFeature, SandboxInfo, SandboxRuntime,
+    TerminalRuntime, WorkspaceSpec,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -219,6 +220,22 @@ impl SandboxRuntime for QemuRuntime {
         }
     }
 
+    fn command_runtime(&self) -> Option<&dyn CommandRuntime> {
+        Some(self)
+    }
+
+    fn terminal_runtime(&self) -> Option<&dyn TerminalRuntime> {
+        Some(self)
+    }
+
+    fn file_transfer_runtime(&self) -> Option<&dyn FileTransferRuntime> {
+        Some(self)
+    }
+
+    fn debug_runtime(&self) -> Option<&dyn DebugRuntime> {
+        Some(self)
+    }
+
     async fn create(&self, spec: &CreateSpec) -> Result<SandboxInfo> {
         if spec.backend != self.backend_id() {
             return Err(RuntimeError::Configuration(format!(
@@ -385,6 +402,33 @@ impl SandboxRuntime for QemuRuntime {
         Ok(info)
     }
 
+    async fn stop(&self, sandbox: &str) -> Result<()> {
+        self.stop_impl(sandbox).await
+    }
+
+    async fn kill(&self, sandbox: &str) -> Result<()> {
+        self.kill_impl(sandbox).await
+    }
+
+    async fn remove(&self, sandbox: &str) -> Result<()> {
+        self.remove_impl(sandbox).await
+    }
+
+    async fn list(&self) -> Result<Vec<SandboxInfo>> {
+        self.list_impl().await
+    }
+
+    async fn inspect(&self, sandbox: &str) -> Result<SandboxInfo> {
+        self.inspect_impl(sandbox).await
+    }
+
+    async fn doctor(&self) -> Result<Vec<(String, bool, String)>> {
+        self.doctor_impl().await
+    }
+}
+
+#[async_trait]
+impl CommandRuntime for QemuRuntime {
     async fn exec_stream(&self, sandbox: &str, request: ExecRequest) -> Result<ExecStream> {
         let state = self.load_state(sandbox)?;
         if !process_alive(&state) {
@@ -461,7 +505,10 @@ impl SandboxRuntime for QemuRuntime {
         });
         Ok(receiver)
     }
+}
 
+#[async_trait]
+impl TerminalRuntime for QemuRuntime {
     async fn attach(&self, sandbox: &str, request: ExecRequest) -> Result<i32> {
         let state = self.load_state(sandbox)?;
         let remote = ssh::remote_command(
@@ -486,7 +533,10 @@ impl SandboxRuntime for QemuRuntime {
             })?;
         Ok(status.code().unwrap_or(-1))
     }
+}
 
+#[async_trait]
+impl FileTransferRuntime for QemuRuntime {
     async fn mkdir(&self, sandbox: &str, guest_path: &str) -> Result<()> {
         self.remote_output(
             sandbox,
@@ -555,8 +605,34 @@ impl SandboxRuntime for QemuRuntime {
             .download(&state, guest_path, host_path)
             .await
     }
+}
 
-    async fn stop(&self, sandbox: &str) -> Result<()> {
+#[async_trait]
+impl DebugRuntime for QemuRuntime {
+    async fn debug_context(&self, sandbox: &str) -> Result<DebugContext> {
+        let state = self.load_state(sandbox)?;
+        let port = state.gdb_port.ok_or_else(|| {
+            RuntimeError::Unsupported(format!(
+                "QEMU sandbox {sandbox} was not opened with a GDB stub"
+            ))
+        })?;
+        let status = self.inspect_impl(sandbox).await?.status;
+        Ok(DebugContext {
+            backend: self.backend_id(),
+            protocol: DebugProtocol::GdbRemote,
+            endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            architecture: state.architecture,
+            accelerator: Some(state.accelerator),
+            status,
+            paused_at_boot: Some(state.debug_paused_at_boot),
+            kaslr_disabled: Some(state.kaslr_disabled),
+            boot_kernel: state.kernel,
+        })
+    }
+}
+
+impl QemuRuntime {
+    async fn stop_impl(&self, sandbox: &str) -> Result<()> {
         let state = self.load_state(sandbox)?;
         if !process_alive(&state) {
             return Ok(());
@@ -591,7 +667,7 @@ impl SandboxRuntime for QemuRuntime {
         }
     }
 
-    async fn kill(&self, sandbox: &str) -> Result<()> {
+    async fn kill_impl(&self, sandbox: &str) -> Result<()> {
         let state = self.load_state(sandbox)?;
         if !process_alive(&state) {
             return Ok(());
@@ -610,7 +686,7 @@ impl SandboxRuntime for QemuRuntime {
         }
     }
 
-    async fn remove(&self, sandbox: &str) -> Result<()> {
+    async fn remove_impl(&self, sandbox: &str) -> Result<()> {
         let state = self.load_state(sandbox)?;
         if process_alive(&state) {
             return Err(RuntimeError::Backend {
@@ -623,7 +699,7 @@ impl SandboxRuntime for QemuRuntime {
             .map_err(|error| state::io_error("remove QEMU sandbox state", &directory, error))
     }
 
-    async fn list(&self) -> Result<Vec<SandboxInfo>> {
+    async fn list_impl(&self) -> Result<Vec<SandboxInfo>> {
         let entries = match fs::read_dir(&self.config.home) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -658,7 +734,7 @@ impl SandboxRuntime for QemuRuntime {
         Ok(sandboxes)
     }
 
-    async fn inspect(&self, sandbox: &str) -> Result<SandboxInfo> {
+    async fn inspect_impl(&self, sandbox: &str) -> Result<SandboxInfo> {
         let state = self.load_state(sandbox)?;
         let status = if !process_alive(&state) {
             "stopped".into()
@@ -704,7 +780,7 @@ impl SandboxRuntime for QemuRuntime {
         })
     }
 
-    async fn doctor(&self) -> Result<Vec<(String, bool, String)>> {
+    async fn doctor_impl(&self) -> Result<Vec<(String, bool, String)>> {
         let architecture = command::normalize_architecture(std::env::consts::ARCH)
             .unwrap_or_else(|_| std::env::consts::ARCH.into());
         let candidate = self
@@ -801,45 +877,6 @@ impl SandboxRuntime for QemuRuntime {
             ));
         }
         Ok(checks)
-    }
-
-    async fn create_snapshot(
-        &self,
-        _name: &str,
-        _sandbox: &str,
-        _labels: &BTreeMap<String, String>,
-    ) -> Result<SnapshotInfo> {
-        Err(RuntimeError::Unsupported(
-            "QEMU managed snapshots are not implemented".into(),
-        ))
-    }
-
-    async fn list_snapshots(&self) -> Result<Vec<SnapshotInfo>> {
-        Err(RuntimeError::Unsupported(
-            "QEMU managed snapshots are not implemented".into(),
-        ))
-    }
-
-    async fn inspect_snapshot(&self, _name: &str) -> Result<SnapshotInfo> {
-        Err(RuntimeError::Unsupported(
-            "QEMU managed snapshots are not implemented".into(),
-        ))
-    }
-
-    async fn remove_snapshot(&self, _name: &str) -> Result<()> {
-        Err(RuntimeError::Unsupported(
-            "QEMU managed snapshots are not implemented".into(),
-        ))
-    }
-
-    async fn list_images(&self) -> Result<Vec<ImageInfo>> {
-        Ok(Vec::new())
-    }
-
-    async fn remove_image(&self, _reference: &str) -> Result<()> {
-        Err(RuntimeError::Unsupported(
-            "QEMU does not manage OCI images".into(),
-        ))
     }
 }
 
@@ -1038,6 +1075,8 @@ fn log_suffix(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -1056,5 +1095,57 @@ mod tests {
     fn rejects_state_path_traversal() {
         assert!(validate_sandbox_id("../other").is_err());
         assert!(validate_sandbox_id("sbx_qemu_good-1").is_ok());
+    }
+
+    #[tokio::test]
+    async fn exposes_typed_debug_context_without_metadata_parsing() {
+        let directory = tempdir().unwrap();
+        let id = "sbx_qemu_context";
+        let runtime = QemuRuntime::new(QemuRuntimeConfig {
+            home: directory.path().into(),
+            binary: None,
+            ssh_binary: None,
+            ssh_user: None,
+            ssh_key: None,
+            boot_timeout: Duration::from_secs(1),
+            shutdown_timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+        let machine_directory = directory.path().join(id);
+        let kernel = directory.path().join("Image");
+        state::save(
+            &machine_directory.join("state.json"),
+            &MachineState {
+                version: STATE_VERSION,
+                id: id.into(),
+                pid: u32::MAX,
+                process_started_at: 1,
+                created_at: Utc::now(),
+                architecture: "aarch64".into(),
+                accelerator: "tcg".into(),
+                qmp_port: 1234,
+                ssh_port: None,
+                gdb_port: Some(1235),
+                debug_paused_at_boot: true,
+                kaslr_disabled: true,
+                kernel: Some(kernel.clone()),
+                ssh_user: None,
+                ssh_key: None,
+                serial_log: machine_directory.join("serial.log"),
+                process_log: machine_directory.join("qemu.log"),
+            },
+        )
+        .unwrap();
+
+        let context = runtime.debug_context(id).await.unwrap();
+        assert_eq!(context.backend, BackendId::qemu());
+        assert_eq!(context.protocol, DebugProtocol::GdbRemote);
+        assert_eq!(context.endpoint, "127.0.0.1:1235".parse().unwrap());
+        assert_eq!(context.architecture, "aarch64");
+        assert_eq!(context.accelerator.as_deref(), Some("tcg"));
+        assert_eq!(context.paused_at_boot, Some(true));
+        assert_eq!(context.kaslr_disabled, Some(true));
+        assert_eq!(context.boot_kernel, Some(kernel));
+        assert_eq!(context.status, "stopped");
     }
 }

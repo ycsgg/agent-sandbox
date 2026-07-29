@@ -10,10 +10,11 @@ use std::{
 };
 
 use agent_sandbox_runtime::{
-    BackendCapabilities, BackendId, BootSourceKind, CreateSpec, ExecEvent, ExecRequest, ExecStream,
-    GuestEntry, ImageInfo, NetworkMode, NetworkRule, NetworkRuleAction, NetworkRuleTarget,
-    OutputStream, Result, RootSource, RuntimeError, RuntimeFeature, SandboxInfo, SandboxRuntime,
-    SecurityMode, SnapshotInfo, WorkspaceSpec,
+    BackendCapabilities, BackendId, BootSourceKind, CommandRuntime, CreateSpec, ExecEvent,
+    ExecRequest, ExecStream, FileTransferRuntime, GuestEntry, ImageInfo, ImageRuntime, NetworkMode,
+    NetworkRule, NetworkRuleAction, NetworkRuleTarget, OutputStream, Result, RootSource,
+    RuntimeError, RuntimeFeature, SandboxInfo, SandboxRuntime, SecurityMode, SnapshotInfo,
+    SnapshotRuntime, TerminalRuntime, WorkspaceSpec,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -66,6 +67,26 @@ impl SandboxRuntime for MicrosandboxRuntime {
         }
     }
 
+    fn command_runtime(&self) -> Option<&dyn CommandRuntime> {
+        Some(self)
+    }
+
+    fn terminal_runtime(&self) -> Option<&dyn TerminalRuntime> {
+        Some(self)
+    }
+
+    fn file_transfer_runtime(&self) -> Option<&dyn FileTransferRuntime> {
+        Some(self)
+    }
+
+    fn snapshot_runtime(&self) -> Option<&dyn SnapshotRuntime> {
+        Some(self)
+    }
+
+    fn image_runtime(&self) -> Option<&dyn ImageRuntime> {
+        Some(self)
+    }
+
     async fn create(&self, spec: &CreateSpec) -> Result<SandboxInfo> {
         if spec.backend != self.backend_id() {
             return Err(RuntimeError::Configuration(format!(
@@ -91,6 +112,11 @@ impl SandboxRuntime for MicrosandboxRuntime {
             RootSource::Machine(_) => {
                 return Err(RuntimeError::Unsupported(
                     "Microsandbox does not accept full-system machine boot specifications".into(),
+                ));
+            }
+            _ => {
+                return Err(RuntimeError::Unsupported(
+                    "Microsandbox does not accept this root source".into(),
                 ));
             }
         };
@@ -159,6 +185,33 @@ impl SandboxRuntime for MicrosandboxRuntime {
         })
     }
 
+    async fn stop(&self, sandbox: &str) -> Result<()> {
+        self.stop_impl(sandbox).await
+    }
+
+    async fn kill(&self, sandbox: &str) -> Result<()> {
+        self.kill_impl(sandbox).await
+    }
+
+    async fn remove(&self, sandbox: &str) -> Result<()> {
+        self.remove_impl(sandbox).await
+    }
+
+    async fn list(&self) -> Result<Vec<SandboxInfo>> {
+        self.list_impl().await
+    }
+
+    async fn inspect(&self, sandbox: &str) -> Result<SandboxInfo> {
+        self.inspect_impl(sandbox).await
+    }
+
+    async fn doctor(&self) -> Result<Vec<(String, bool, String)>> {
+        self.doctor_impl().await
+    }
+}
+
+#[async_trait]
+impl CommandRuntime for MicrosandboxRuntime {
     async fn exec_stream(&self, sandbox: &str, request: ExecRequest) -> Result<ExecStream> {
         let sandbox = self.connect(sandbox).await?;
         let ExecRequest {
@@ -305,7 +358,10 @@ impl SandboxRuntime for MicrosandboxRuntime {
         });
         Ok(receiver)
     }
+}
 
+#[async_trait]
+impl TerminalRuntime for MicrosandboxRuntime {
     async fn attach(&self, sandbox: &str, request: ExecRequest) -> Result<i32> {
         let sandbox = self.connect(sandbox).await?;
         let ExecRequest {
@@ -333,7 +389,10 @@ impl SandboxRuntime for MicrosandboxRuntime {
             .await
             .map_err(|error| backend("attach guest terminal", error))
     }
+}
 
+#[async_trait]
+impl FileTransferRuntime for MicrosandboxRuntime {
     async fn mkdir(&self, sandbox: &str, guest_path: &str) -> Result<()> {
         self.connect(sandbox)
             .await?
@@ -422,8 +481,10 @@ impl SandboxRuntime for MicrosandboxRuntime {
             .await
             .map_err(|error| backend("download artifact", error))
     }
+}
 
-    async fn stop(&self, sandbox: &str) -> Result<()> {
+impl MicrosandboxRuntime {
+    async fn stop_impl(&self, sandbox: &str) -> Result<()> {
         let attached = {
             self.attached
                 .lock()
@@ -452,7 +513,7 @@ impl SandboxRuntime for MicrosandboxRuntime {
         result
     }
 
-    async fn kill(&self, sandbox: &str) -> Result<()> {
+    async fn kill_impl(&self, sandbox: &str) -> Result<()> {
         let attached = {
             self.attached
                 .lock()
@@ -479,7 +540,7 @@ impl SandboxRuntime for MicrosandboxRuntime {
         result
     }
 
-    async fn remove(&self, sandbox: &str) -> Result<()> {
+    async fn remove_impl(&self, sandbox: &str) -> Result<()> {
         Sandbox::get(sandbox)
             .await
             .map_err(|error| backend("find sandbox to remove", error))?
@@ -488,7 +549,7 @@ impl SandboxRuntime for MicrosandboxRuntime {
             .map_err(|error| backend("remove sandbox", error))
     }
 
-    async fn list(&self) -> Result<Vec<SandboxInfo>> {
+    async fn list_impl(&self) -> Result<Vec<SandboxInfo>> {
         let handles = Sandbox::list()
             .await
             .map_err(|error| backend("list sandboxes", error))?;
@@ -504,7 +565,7 @@ impl SandboxRuntime for MicrosandboxRuntime {
             .collect())
     }
 
-    async fn inspect(&self, sandbox: &str) -> Result<SandboxInfo> {
+    async fn inspect_impl(&self, sandbox: &str) -> Result<SandboxInfo> {
         let handle = Sandbox::get(sandbox)
             .await
             .map_err(|error| backend("inspect sandbox", error))?;
@@ -517,7 +578,7 @@ impl SandboxRuntime for MicrosandboxRuntime {
         })
     }
 
-    async fn doctor(&self) -> Result<Vec<(String, bool, String)>> {
+    async fn doctor_impl(&self) -> Result<Vec<(String, bool, String)>> {
         let diagnosis = microsandbox::setup::diagnose();
         let mut checks = Vec::new();
         for section in diagnosis.sections {
@@ -534,7 +595,10 @@ impl SandboxRuntime for MicrosandboxRuntime {
         }
         Ok(checks)
     }
+}
 
+#[async_trait]
+impl SnapshotRuntime for MicrosandboxRuntime {
     async fn create_snapshot(
         &self,
         name: &str,
@@ -580,7 +644,10 @@ impl SandboxRuntime for MicrosandboxRuntime {
             .await
             .map_err(|error| backend("remove snapshot", error))
     }
+}
 
+#[async_trait]
+impl ImageRuntime for MicrosandboxRuntime {
     async fn list_images(&self) -> Result<Vec<ImageInfo>> {
         Ok(microsandbox::image::Image::list()
             .await
