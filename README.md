@@ -1,235 +1,295 @@
 # Agent Sandbox
 
-`asbx` runs isolated workloads through pluggable local VM backends.
-Microsandbox handles OCI-based project commands; QEMU handles bootable disks,
-direct kernel boot, multiple guest architectures, serial logs, QMP, and an
-optional loopback GDB stub; Cuttlefish handles Android phone images on Linux
-KVM hosts through ADB; Android Emulator runs existing SDK AVDs on macOS,
-Windows, and Linux. Project code is copied into the guest by default, host
-environment variables are not inherited, public networking excludes
-host/private/link-local ranges, and one-shot VMs are removed after execution.
-Guest output is streamed through bounded queues; retained JSON tails and
-artifacts are capped by host configuration. Cross-process SQLite reservations
-enforce both global VM count and reserved-memory ceilings.
+English | [简体中文](README.zh-CN.md)
 
-Backends implement a small lifecycle contract and opt into independent command,
-terminal, file-transfer, snapshot, image-cache, and remote-debug capabilities.
-Registry validation rejects a backend whose declared features do not match its
-implemented capabilities, so adding an unrelated feature does not require
-placeholder changes in every adapter.
+Agent Sandbox is a local isolation runtime for coding agents. A person installs
+the `asbx` CLI, prepares one or more virtualization backends, and installs the
+bundled Agent Skill. The agent then decides when and how to create disposable
+sandboxes.
 
-Copy mode respects project `.gitignore` and `.agent-sandbox-ignore` files,
-rejects escaping symlinks, and constructs guest paths with POSIX semantics on
-Linux, macOS, and Windows hosts.
+It is not intended to be a general-purpose VM manager or an interactive
+application for humans:
 
-Authorized projects can instead be mounted read-only or, behind an explicit
-host gate and write quota, read-write. Network policies support offline,
-public-only, statically inferred dependency registries, and deny-by-default
-domain/CIDR/port rules.
+```text
+Codex / Claude Code / Cursor / Gemini CLI / OpenCode
+                         │
+                  Agent Skill + shell
+                         │
+                       asbx
+                         │
+        Microsandbox / QEMU / Cuttlefish / Android Emulator
+```
 
-## Build
+This README is therefore for the person who provisions the machine or
+integrates another backend. Agent workflows and command-selection guidance live
+in the bundled [`agent-sandbox` Skill](skill/agent-sandbox/SKILL.md).
 
-The repository pins the published Microsandbox Rust SDK at v0.6.7. A local
-`microsandbox/` checkout may be kept beside the wrapper for source inspection,
-but it is intentionally ignored by Git.
+## Install the CLI
+
+Prebuilt binaries are not published yet. Install from a checkout with Rust 1.94
+or newer:
 
 ```bash
-cargo build --release -p agent-sandbox-cli
 cargo install --path crates/cli
+asbx --version
+```
+
+Run setup once after installing or upgrading the CLI:
+
+```bash
 asbx setup
 ```
 
-Rust 1.94 or newer is required. Microsandbox v0.6.7 uses KVM on Linux,
-Hypervisor.framework on Apple Silicon macOS, and Windows Hypervisor Platform
-on Windows. The QEMU backend selects KVM, HVF, or WHPX for same-architecture
-guests and falls back to TCG for cross-architecture guests. QEMU is optional
-unless that backend is selected. Cuttlefish is optional and requires Linux,
-read/write access to KVM and vhost-vsock, the Cuttlefish host packages, and
-matching host-tool/device-image artifacts. Android Emulator is optional and
-requires the Android SDK Emulator, platform-tools/ADB, a compatible AVD, and
-working host acceleration (Hypervisor.Framework, WHPX, or KVM).
+Setup detects installed agent harnesses and backends, displays the changes it
+would make, and asks before modifying the machine. It can install the
+Microsandbox runtime, invoke a supported package manager for QEMU, create the
+host configuration, and install the Agent Skill.
 
-This repository does not yet publish prebuilt `asbx` binaries or a package
-manager formula, so end users currently install from a checkout. Building
-downloads the pinned Microsandbox guest agent into Cargo's build output, but
-does not provision `msb` or `libkrunfw` into the user's home. `asbx setup` is
-the target-machine installation, verification, and repair entry point.
-
-## Setup
-
-Run the setup wizard after installation and whenever the selected backend or
-agent CLI changes:
+For an explicit or non-interactive installation:
 
 ```bash
-asbx setup
-asbx setup --check
+asbx setup \
+  --default-backend microsandbox \
+  --harness codex,claude-code \
+  --yes
+
 asbx setup --check --json
 ```
 
-The wizard diagnoses Microsandbox, QEMU, configured Cuttlefish artifacts,
-Android SDK Emulator tools/acceleration/AVD readiness, and local Codex, Claude
-Code, Cursor, Gemini CLI, and OpenCode installations. It prints one plan and
-asks for confirmation before downloading a runtime, invoking a system package
-manager, creating the host config, or installing the Agent Skill.
-When Microsandbox runtime files are missing, setup resolves GitHub's latest
-stable release at runtime and verifies the selected platform bundle against
-the release asset's published SHA-256. It never silently changes backends or
-falls back to host execution.
+`--yes` applies the displayed plan without prompting. `--check` is read-only
+and exits non-zero when an action or manual fix is still required.
 
-Codex, Cursor, Gemini CLI, and OpenCode share the open Agent Skills location
-`~/.agents/skills/agent-sandbox`. Claude Code uses
-`~/.claude/skills/agent-sandbox`. Re-running setup is idempotent; an existing
-unmanaged skill is not changed without `--force`.
+The Skill is installed in:
 
-Explicit reconfiguration is available for scripts and less common layouts:
+- `~/.agents/skills/agent-sandbox` for Codex, Cursor, Gemini CLI, and OpenCode
+- `~/.claude/skills/agent-sandbox` for Claude Code
+
+Re-run `asbx setup` after upgrading so managed Skill files stay in sync with
+the CLI. Agent Sandbox uses a Skill and the agent's existing shell capability;
+it does not require an MCP server or a resident `asbx` daemon.
+
+## Choose a backend
+
+The backends are intentionally different. Choose the one that matches the
+workload instead of treating them as interchangeable VM implementations.
+
+| Backend | Use it for | Host support | Setup behavior |
+|---|---|---|---|
+| `microsandbox` | Normal repository builds, tests, OCI images, and language environments | Automatic setup on Apple Silicon macOS and x86_64/ARM64 Linux | Downloads and verifies the runtime |
+| `android-emulator` | Existing Android SDK AVDs | macOS, Linux, Windows | Verifies tools, acceleration, and the configured AVD |
+| `cuttlefish` | AOSP/Cuttlefish phone images and offline Android jobs | Linux with KVM and vhost-vsock | Verifies host devices, tools, and artifacts |
+| `qemu` | Boot disks, custom kernels, other architectures, serial/QMP/GDB | macOS, Linux, Windows; TCG is available for cross-architecture guests | Can install QEMU through supported macOS/Linux package managers |
+
+Microsandbox is the default for ordinary coding-agent work. Android Emulator is
+the portable Android choice. Cuttlefish is the stronger choice for offline
+Android isolation when a compatible Linux host is available. QEMU is for
+full-machine jobs rather than normal OCI project execution.
+
+`asbx` never falls back to running guest commands directly on the host when a
+backend is unavailable.
+
+## Prepare Microsandbox
+
+On a supported host, setup can provision Microsandbox without a separate manual
+installation:
 
 ```bash
 asbx setup --default-backend microsandbox
-asbx setup --install-backend qemu
-asbx setup --install-backend cuttlefish
-asbx setup --install-backend android-emulator
-asbx setup --harness codex,claude-code
-asbx setup --no-harness
-asbx setup --yes
+asbx doctor --backend microsandbox
 ```
 
-`--yes` applies the displayed deterministic plan without prompting and is
-required for non-interactive mutation. `--check` never writes. QEMU is
-installed only when selected, using a detected system package manager after
-confirmation. Cuttlefish setup is verification-only: install its Linux host
-packages separately, extract a matching `cvd-host_package.tar.gz` and Android
-device-image archive into one directory, and set `cuttlefish.artifacts`.
-Android Emulator setup is also verification-only: install the Android SDK
-Emulator and platform-tools, create an AVD, and set `android_emulator.avd` (or
-pass `--android-avd` for each run).
+Setup resolves the latest stable runtime bundle and verifies its published
+SHA-256 before installation. The Rust build embeds the matching guest agent but
+does not install the host runtime by itself.
 
-## Usage
+Use Microsandbox for the default Agent Skill workflow: copied projects, OCI
+images, reusable language environments, filtered networking, services, and
+artifacts.
+
+## Prepare Android Emulator
+
+Android Emulator is the cross-platform Android backend. First install these
+components with Android Studio or the Android SDK command-line tools:
+
+- Android SDK Emulator
+- Android SDK Platform-Tools (`adb`)
+- a system image compatible with the host architecture
+- an Android Virtual Device created from that image
+- working host acceleration: Hypervisor.Framework, KVM, or WHPX
+
+Check the Android installation before configuring `asbx`:
 
 ```bash
-asbx setup --check --no-harness
-asbx env detect --project . --json
-asbx run --project . --env auto -- cargo test --workspace
-asbx run --project . --project-mode mount-ro --network dependencies -- cargo fetch
-
-asbx env create audit-full --base ubuntu:24.04 \
-  --toolchain go@1.24 --toolchain rust@1.88 --toolchain node@22
-asbx run --project . --env audit-full -- ./scripts/verify.sh
-
-id="$(asbx open --project . --env node@22)"
-asbx exec "$id" -- npm ci
-asbx exec "$id" -- npm test
-asbx close "$id"
-
-# Cross-platform Android SDK Emulator. This always requires an explicit,
-# host-approved --network all because portable filtered isolation is unavailable.
-asbx doctor --backend android-emulator
-asbx run --android-avd TestPhone --project-mode none --network all -- \
-  getprop ro.build.version.release
-
-# Android Cuttlefish; --android-artifacts also implies --backend cuttlefish.
-asbx doctor --backend cuttlefish
-asbx run --android-artifacts /opt/android/cuttlefish \
-  --project-mode none --network off -- getprop ro.build.version.release
-
-id="$(asbx open --backend cuttlefish --project . --network off)"
-asbx exec "$id" -- ls /data/local/tmp/asbx/workspace
-asbx exec "$id" -- sh -c \
-  'getprop > /data/local/tmp/asbx/out/properties.txt'
-asbx artifact get "$id" /data/local/tmp/asbx/out/properties.txt \
-  --to ./properties.txt
-asbx close "$id"
-
-asbx cache status --json
-asbx cache prune --max-size 20G --dry-run --json
-
-asbx backend list --json
-id="$(asbx open --backend qemu --root-disk ./guest.qcow2 \
-  --firmware ./QEMU_EFI.fd --project-mode none --network off)"
-asbx inspect "$id" --json
-asbx close "$id"
-
-# Direct kernel boot with an automatically allocated loopback GDB port.
-id="$(asbx open --backend qemu --kernel ./Image --initrd ./initramfs.cpio.gz \
-  --kernel-append 'console=ttyAMA0' --gdb --pause-at-boot \
-  --project-mode none --network off)"
-asbx debug "$id" --print-command --json
-asbx debug "$id" --symbols ./vmlinux
-asbx close "$id"
+emulator -accel-check
+emulator -list-avds
+adb version
 ```
 
-## Proxy and registry access
-
-`asbx` inherits `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` for
-host-side OCI image pulls. Persistent settings can be placed in
-`~/.agent-sandbox/config.toml` (or the file passed with `--config`):
+Add the AVD to `~/.agent-sandbox/config.toml`:
 
 ```toml
-[proxy]
-inherit_env = false
-http = "http://127.0.0.1:7890"
-https = "http://127.0.0.1:7890"
-# `all` is also supported when one proxy handles both schemes.
-no_proxy = ["localhost", "127.0.0.1", "::1"]
-inject_guest = false
+[android_emulator]
+avd = "TestPhone"
+boot_timeout = "5m"
+shutdown_timeout = "30s"
+gpu = "auto"
+
+# Usually discovered from ANDROID_SDK_ROOT or standard SDK locations.
+# sdk_root = "/path/to/Android/sdk"
+# emulator = "/path/to/Android/sdk/emulator/emulator"
+# adb = "/path/to/Android/sdk/platform-tools/adb"
+
+[network]
+allow_all_mode = true
 ```
 
-File-backed settings are applied by a one-time self re-exec before registry
-clients are constructed; no proxy helper or resident `asbx` daemon is started.
-File-backed proxy URLs must use HTTP(S). Docker Hub shorthand such as
-`alpine:3.20`, `library/alpine`, and `docker.io/library/alpine` is normalized
-to `registry-1.docker.io`, avoiding the legacy `index.docker.io` endpoint.
+Then select and verify it:
 
-`inject_guest` is intentionally off by default. Enable it only when the proxy
-address and network policy are reachable from inside the VM; `127.0.0.1` in a
-guest is not the host and therefore is not a usable guest proxy endpoint.
+```bash
+asbx setup --default-backend android-emulator
+asbx doctor --backend android-emulator
 
-QEMU machine mode defaults to no workspace and offline networking. A writable
-root disk uses QEMU temporary snapshot mode, so the caller-owned base image is
-not modified. Configure `qemu.ssh_user` (and usually `qemu.ssh_key`) to enable
-`copy`, `exec`, `shell`, and artifact transfer for guests that run SSH.
-Filtered `public`, `dependencies`, and `rules` networking remains a
-Microsandbox capability; QEMU currently accepts only `off` and host-gated
-`all`. QEMU lease expiry is enforced on the next `asbx` invocation; unlike
-Microsandbox, the QEMU adapter does not install an always-running TTL helper.
+# Optional end-to-end smoke test
+asbx run --android-avd TestPhone \
+  --project-mode none \
+  --network all \
+  -- getprop ro.build.version.release
+```
 
-Cuttlefish accepts project modes `none` and `copy`. Its workspace is
-`/data/local/tmp/asbx/workspace`, its downloadable artifact directory is
-`/data/local/tmp/asbx/out`, and its default shell is `/system/bin/sh`.
-Networking defaults to `off` by launching recent Cuttlefish tools without TAP
-devices. Host-gated `all` is also available; filtered modes, host mounts,
-published guest ports, and the wrapper restricted profile are rejected until
-they can be enforced honestly. Like QEMU, Cuttlefish lease expiry is reclaimed
-on the next `asbx` invocation rather than by a resident helper.
+Each sandbox cold-boots a private copy of the source AVD configuration with
+fresh data state. The source AVD is not started or modified.
 
-Android Emulator also accepts project modes `none` and `copy` and uses the
-same Android guest workspace, artifact, and shell paths as Cuttlefish. Each
-sandbox receives a fresh wrapper-owned private AVD directory, cold-boots
-headlessly, uses a dedicated console/ADB pair and ADB server, and removes that
-state at cleanup without modifying the source AVD. Because the SDK Emulator
-does not provide a portable complete egress-disable primitive, the backend
-requires both an explicit `--network all` and
-`network.allow_all_mode = true`; filtered modes, host mounts, published guest
-ports, snapshots, OCI images, and the wrapper restricted profile are rejected.
-Emulator memory requests must be between 1536 MiB and 8192 MiB.
+Android Emulator requires explicit `--network all` and the host-side
+`network.allow_all_mode = true` gate. The SDK Emulator has no portable
+interface through which `asbx` can enforce complete offline or filtered egress.
+Use Cuttlefish on Linux if unrestricted Android networking is unacceptable.
 
-`asbx debug` validates the session, loopback endpoint, symbol architecture,
-and debugger executable before attaching. It automatically selects LLDB on
-macOS and GDB on other hosts. Without `--symbols`, a direct-boot kernel is
-reported as context but is not loaded into the host debugger; remote
-registers, memory, and disassembly remain available. Debugger init files and
-symbol-script auto-loading are disabled by default.
+## Prepare Cuttlefish
 
-See [`skill/agent-sandbox/SKILL.md`](skill/agent-sandbox/SKILL.md) and
-[`agent-sandbox.md`](agent-sandbox.md) for workflows and design rationale.
+Cuttlefish requires a Linux host with read/write access to both `/dev/kvm` and
+`/dev/vhost-vsock`. Install the Cuttlefish host packages appropriate for the
+host, then extract these two matching Android build artifacts into one
+directory:
 
-## Safety notes
+- `cvd-host_package.tar.gz`
+- the Cuttlefish device-image archive
 
-`mount-rw` lets guest code modify the authorized host project and is disabled
-unless `workspace.allow_rw_mount` is enabled. Named environments contain only
-trusted wrapper provisioning, never project install hooks. Cache pruning keeps
-named environments by default; use `--include-environments` explicitly and
-review `--dry-run` output before removing them.
+Configure that directory:
 
-`asbx debug --symbols` causes a trusted host debugger to parse that file.
-Supply only a symbol artifact you intend to expose to a host process; the
-guest boot image is never loaded implicitly.
+```toml
+[cuttlefish]
+artifacts = "/opt/android/cuttlefish"
+boot_timeout = "5m"
+shutdown_timeout = "30s"
+```
+
+Select and verify the backend:
+
+```bash
+asbx setup --default-backend cuttlefish
+asbx doctor --backend cuttlefish
+
+# Optional end-to-end smoke test
+asbx run --backend cuttlefish \
+  --project-mode none \
+  --network off \
+  -- getprop ro.build.version.release
+```
+
+`asbx setup` does not download Android images or install Cuttlefish host
+packages; it verifies the artifacts and host capabilities already provided.
+Recent host tools with `--enable_tap_devices` support are required for the
+backend's offline mode.
+
+## Prepare QEMU
+
+On macOS or Linux, setup can invoke a detected package manager after showing
+the exact command:
+
+```bash
+asbx setup --install-backend qemu
+asbx doctor --backend qemu
+```
+
+On Windows, or for a custom installation, install QEMU separately and point
+`asbx` at the system binary when it is not on `PATH`:
+
+```toml
+[qemu]
+binary = "/path/to/qemu-system-aarch64"
+boot_timeout = "2m"
+shutdown_timeout = "10s"
+```
+
+Lifecycle, serial output, QMP, and a loopback GDB stub work without software in
+the guest. Project copy, agent commands, shell access, and artifact transfer
+require SSH inside the guest:
+
+```toml
+[qemu]
+ssh_user = "root"
+ssh_key = "/path/to/qemu_guest_key"
+```
+
+The caller supplies a boot disk or kernel for each job. Writable root disks use
+QEMU snapshot mode, so the base image is not modified.
+
+## Set host policy
+
+The machine owner controls the hard limits in
+`~/.agent-sandbox/config.toml`. Start from
+[`config.example.toml`](config.example.toml), then review at least:
+
+- authorized workspace roots and whether read-write mounts are allowed
+- default network mode and the high-risk `allow_all_mode` gate
+- CPU, memory, disk, output, transfer, and cache ceilings
+- backend-specific paths, timeouts, and credentials
+
+Agent requests may narrow these limits but cannot silently widen them. Host
+environment variables and credentials are not inherited by guests unless the
+caller passes specific values.
+
+Verify the completed handoff with:
+
+```bash
+asbx setup --check --json
+asbx backend list --json
+asbx doctor --backend microsandbox
+```
+
+Replace the last backend name with the backend selected for the machine. Once
+these checks pass and the Skill is installed, the agent has the instructions it
+needs to choose `run`, `open`/`exec`/`close`, networking, project exposure, and
+artifact handling.
+
+## Adapt another backend
+
+Backend adapters implement a small lifecycle contract and opt into only the
+operations they actually support:
+
+1. Add a runtime crate that implements
+   [`SandboxRuntime`](crates/runtime/lib/lib.rs) and its readiness checks.
+2. Implement only the applicable optional traits, such as `CommandRuntime`,
+   `TerminalRuntime`, `FileTransferRuntime`, `SnapshotRuntime`, `ImageRuntime`,
+   or `DebugRuntime`.
+3. Declare matching `BackendCapabilities`. The registry rejects mismatches
+   between declared features and implemented capability accessors.
+4. Register and configure the adapter in
+   [`app/bootstrap.rs`](crates/cli/bin/app/bootstrap.rs).
+5. Extend [`app/setup.rs`](crates/cli/bin/app/setup.rs) if the backend needs
+   host installation or verification, and add contract and lifecycle tests.
+
+The backend-neutral core does not require placeholder implementations for
+unsupported features. See the
+[`RuntimeRegistry`](crates/runtime/lib/registry.rs), existing
+[`QEMU`](crates/runtime-qemu/lib/lib.rs) and
+[`Android Emulator`](crates/runtime-android-emulator/lib/lib.rs) adapters, and
+the [design document](agent-sandbox.md) for the complete contract.
+
+## Reference
+
+- [Agent instructions](skill/agent-sandbox/SKILL.md)
+- [CLI reference](skill/agent-sandbox/references/cli.md)
+- [Environment selection](skill/agent-sandbox/references/environments.md)
+- [Troubleshooting](skill/agent-sandbox/references/troubleshooting.md)
+- [Architecture and security model](agent-sandbox.md)
