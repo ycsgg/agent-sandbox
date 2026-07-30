@@ -91,6 +91,8 @@ pub struct HostConfig {
     pub qemu: QemuConfig,
     /// Android Cuttlefish backend settings.
     pub cuttlefish: CuttlefishConfig,
+    /// Android SDK Emulator backend settings.
+    pub android_emulator: AndroidEmulatorConfig,
     /// Host HTTP proxy settings used by registry and other wrapper clients.
     pub proxy: ProxyConfig,
     /// Authorized workspace roots.
@@ -151,6 +153,26 @@ pub struct CuttlefishConfig {
     pub boot_timeout: String,
     /// Device shutdown deadline.
     pub shutdown_timeout: String,
+}
+
+/// Android SDK Emulator backend settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AndroidEmulatorConfig {
+    /// Android SDK root override.
+    pub sdk_root: Option<PathBuf>,
+    /// Android Emulator executable override.
+    pub emulator: Option<PathBuf>,
+    /// ADB executable override.
+    pub adb: Option<PathBuf>,
+    /// Default source AVD name.
+    pub avd: Option<String>,
+    /// Device boot and ADB readiness deadline.
+    pub boot_timeout: String,
+    /// Device shutdown deadline.
+    pub shutdown_timeout: String,
+    /// Graphics backend: auto, host, software, swiftshader, swangle, or lavapipe.
+    pub gpu: String,
 }
 
 /// Host HTTP proxy settings.
@@ -390,6 +412,20 @@ impl Default for CuttlefishConfig {
     }
 }
 
+impl Default for AndroidEmulatorConfig {
+    fn default() -> Self {
+        Self {
+            sdk_root: None,
+            emulator: None,
+            adb: None,
+            avd: None,
+            boot_timeout: "5m".into(),
+            shutdown_timeout: "30s".into(),
+            gpu: "auto".into(),
+        }
+    }
+}
+
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
@@ -522,7 +558,10 @@ impl HostConfig {
     ) -> Result<EffectiveSpec> {
         if !matches!(
             self.runtime.backend.as_str(),
-            BackendId::MICROSANDBOX | BackendId::QEMU | BackendId::CUTTLEFISH
+            BackendId::MICROSANDBOX
+                | BackendId::QEMU
+                | BackendId::CUTTLEFISH
+                | BackendId::ANDROID_EMULATOR
         ) {
             return Err(PolicyError::Forbidden(format!(
                 "unsupported runtime backend {:?}",
@@ -531,7 +570,10 @@ impl HostConfig {
         }
         if !matches!(
             requested.backend.as_str(),
-            BackendId::MICROSANDBOX | BackendId::QEMU | BackendId::CUTTLEFISH
+            BackendId::MICROSANDBOX
+                | BackendId::QEMU
+                | BackendId::CUTTLEFISH
+                | BackendId::ANDROID_EMULATOR
         ) {
             return Err(PolicyError::Forbidden(format!(
                 "unsupported runtime backend {:?}",
@@ -539,32 +581,45 @@ impl HostConfig {
             )));
         }
         match (requested.backend.as_str(), &requested.root) {
-            (BackendId::MICROSANDBOX, RootSource::Machine(_)) => {
+            (
+                BackendId::MICROSANDBOX,
+                RootSource::Machine(_) | RootSource::Android(_) | RootSource::AndroidEmulator(_),
+            ) => {
                 return Err(PolicyError::Forbidden(
-                    "machine boot sources require the qemu backend".into(),
+                    "the selected boot source does not belong to the microsandbox backend".into(),
                 ));
             }
-            (BackendId::QEMU, RootSource::Image(_) | RootSource::Snapshot(_)) => {
+            (
+                BackendId::QEMU,
+                RootSource::Image(_)
+                | RootSource::Snapshot(_)
+                | RootSource::Android(_)
+                | RootSource::AndroidEmulator(_),
+            ) => {
                 return Err(PolicyError::Forbidden(
                     "the qemu backend requires a machine boot source".into(),
                 ));
             }
-            (BackendId::QEMU, RootSource::Android(_)) => {
-                return Err(PolicyError::Forbidden(
-                    "Android artifacts require the cuttlefish backend".into(),
-                ));
-            }
             (
                 BackendId::CUTTLEFISH,
-                RootSource::Image(_) | RootSource::Snapshot(_) | RootSource::Machine(_),
+                RootSource::Image(_)
+                | RootSource::Snapshot(_)
+                | RootSource::Machine(_)
+                | RootSource::AndroidEmulator(_),
             ) => {
                 return Err(PolicyError::Forbidden(
                     "the cuttlefish backend requires Android artifacts".into(),
                 ));
             }
-            (BackendId::MICROSANDBOX, RootSource::Android(_)) => {
+            (
+                BackendId::ANDROID_EMULATOR,
+                RootSource::Image(_)
+                | RootSource::Snapshot(_)
+                | RootSource::Machine(_)
+                | RootSource::Android(_),
+            ) => {
                 return Err(PolicyError::Forbidden(
-                    "Android artifacts require the cuttlefish backend".into(),
+                    "the android-emulator backend requires an Android Virtual Device".into(),
                 ));
             }
             _ => {}
@@ -632,28 +687,42 @@ impl HostConfig {
                     .into(),
             ));
         }
+        if requested.backend.as_str() == BackendId::ANDROID_EMULATOR && network != NetworkMode::All
+        {
+            return Err(PolicyError::Forbidden(
+                "the android-emulator backend currently supports only explicitly host-gated network mode 'all'"
+                    .into(),
+            ));
+        }
         let network_rules = self.validate_network_rules(network, requested.network_rules)?;
 
-        if requested.backend.as_str() == BackendId::CUTTLEFISH
-            && !matches!(
-                requested.project_mode,
-                ProjectMode::None | ProjectMode::Copy
-            )
-        {
+        if matches!(
+            requested.backend.as_str(),
+            BackendId::CUTTLEFISH | BackendId::ANDROID_EMULATOR
+        ) && !matches!(
+            requested.project_mode,
+            ProjectMode::None | ProjectMode::Copy
+        ) {
             return Err(PolicyError::Forbidden(
-                "the cuttlefish backend supports project modes 'none' and 'copy' only".into(),
+                "Android backends support project modes 'none' and 'copy' only".into(),
             ));
         }
-        if requested.backend.as_str() == BackendId::CUTTLEFISH && !requested.ports.is_empty() {
-            return Err(PolicyError::Forbidden(
-                "the cuttlefish backend does not yet support guest port publication".into(),
-            ));
-        }
-        if requested.backend.as_str() == BackendId::CUTTLEFISH
-            && requested.security != SecurityMode::Default
+        if matches!(
+            requested.backend.as_str(),
+            BackendId::CUTTLEFISH | BackendId::ANDROID_EMULATOR
+        ) && !requested.ports.is_empty()
         {
             return Err(PolicyError::Forbidden(
-                "the cuttlefish backend does not implement the restricted security profile".into(),
+                "Android backends do not yet support guest port publication".into(),
+            ));
+        }
+        if matches!(
+            requested.backend.as_str(),
+            BackendId::CUTTLEFISH | BackendId::ANDROID_EMULATOR
+        ) && requested.security != SecurityMode::Default
+        {
+            return Err(PolicyError::Forbidden(
+                "Android backends do not implement the restricted security profile".into(),
             ));
         }
 
@@ -1178,7 +1247,7 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use agent_sandbox_runtime::{AndroidBootSpec, MachineBootSpec, RootSource};
+    use agent_sandbox_runtime::{AndroidAvdSpec, AndroidBootSpec, MachineBootSpec, RootSource};
     use tempfile::tempdir;
 
     use super::*;
@@ -1187,6 +1256,14 @@ mod tests {
     fn parses_documented_sizes_and_durations() {
         assert_eq!(parse_bytes("2G", "test").unwrap(), 2 * 1024_u64.pow(3));
         assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn example_config_includes_valid_android_emulator_defaults() {
+        let config: HostConfig =
+            toml::from_str(include_str!("../../../config.example.toml")).unwrap();
+        assert_eq!(config.android_emulator.boot_timeout, "5m");
+        assert_eq!(config.android_emulator.gpu, "auto");
     }
 
     #[test]
@@ -1336,6 +1413,57 @@ mod tests {
         requested.project_mode = ProjectMode::MountReadOnly;
         assert!(matches!(
             HostConfig::default().enforce(requested, root.path()),
+            Err(PolicyError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn android_emulator_requires_host_gated_unrestricted_networking() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut requested = request(project);
+        requested.backend = BackendId::android_emulator();
+        requested.root = RootSource::AndroidEmulator(Box::new(AndroidAvdSpec {
+            name: "TestPhone".into(),
+        }));
+        requested.network = Some(NetworkMode::All);
+
+        assert!(matches!(
+            HostConfig::default().enforce(requested.clone(), root.path()),
+            Err(PolicyError::Forbidden(_))
+        ));
+
+        let mut config = HostConfig::default();
+        config.network.allow_all_mode = true;
+        let effective = config.enforce(requested, root.path()).unwrap();
+        assert_eq!(effective.backend, BackendId::android_emulator());
+        assert_eq!(effective.network, NetworkMode::All);
+        assert_eq!(effective.project_mode, ProjectMode::Copy);
+    }
+
+    #[test]
+    fn android_emulator_rejects_filtered_network_and_host_mounts() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut requested = request(project);
+        requested.backend = BackendId::android_emulator();
+        requested.root = RootSource::AndroidEmulator(Box::new(AndroidAvdSpec {
+            name: "TestPhone".into(),
+        }));
+        requested.network = Some(NetworkMode::Off);
+        assert!(matches!(
+            HostConfig::default().enforce(requested.clone(), root.path()),
+            Err(PolicyError::Forbidden(_))
+        ));
+
+        let mut config = HostConfig::default();
+        config.network.allow_all_mode = true;
+        requested.network = Some(NetworkMode::All);
+        requested.project_mode = ProjectMode::MountReadOnly;
+        assert!(matches!(
+            config.enforce(requested, root.path()),
             Err(PolicyError::Forbidden(_))
         ));
     }

@@ -9,6 +9,7 @@ members = [
     "crates/exec",
     "crates/policy",
     "crates/runtime",
+    "crates/runtime-android-emulator",
     "crates/runtime-cuttlefish",
     "crates/runtime-msb",
     "crates/runtime-qemu",
@@ -30,6 +31,7 @@ agent-sandbox-environment = { path = "crates/environment" }
 agent-sandbox-exec = { path = "crates/exec" }
 agent-sandbox-policy = { path = "crates/policy" }
 agent-sandbox-runtime = { path = "crates/runtime" }
+agent-sandbox-runtime-android-emulator = { path = "crates/runtime-android-emulator" }
 agent-sandbox-runtime-cuttlefish = { path = "crates/runtime-cuttlefish" }
 agent-sandbox-runtime-msb = { path = "crates/runtime-msb" }
 agent-sandbox-runtime-qemu = { path = "crates/runtime-qemu" }

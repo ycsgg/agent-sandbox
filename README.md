@@ -4,7 +4,8 @@
 Microsandbox handles OCI-based project commands; QEMU handles bootable disks,
 direct kernel boot, multiple guest architectures, serial logs, QMP, and an
 optional loopback GDB stub; Cuttlefish handles Android phone images on Linux
-KVM hosts through ADB. Project code is copied into the guest by default, host
+KVM hosts through ADB; Android Emulator runs existing SDK AVDs on macOS,
+Windows, and Linux. Project code is copied into the guest by default, host
 environment variables are not inherited, public networking excludes
 host/private/link-local ranges, and one-shot VMs are removed after execution.
 Guest output is streamed through bounded queues; retained JSON tails and
@@ -44,7 +45,9 @@ on Windows. The QEMU backend selects KVM, HVF, or WHPX for same-architecture
 guests and falls back to TCG for cross-architecture guests. QEMU is optional
 unless that backend is selected. Cuttlefish is optional and requires Linux,
 read/write access to KVM and vhost-vsock, the Cuttlefish host packages, and
-matching host-tool/device-image artifacts.
+matching host-tool/device-image artifacts. Android Emulator is optional and
+requires the Android SDK Emulator, platform-tools/ADB, a compatible AVD, and
+working host acceleration (Hypervisor.Framework, WHPX, or KVM).
 
 This repository does not yet publish prebuilt `asbx` binaries or a package
 manager formula, so end users currently install from a checkout. Building
@@ -63,11 +66,11 @@ asbx setup --check
 asbx setup --check --json
 ```
 
-The wizard diagnoses Microsandbox, QEMU, configured Cuttlefish artifacts, and
-local Codex, Claude Code, Cursor, Gemini CLI, and OpenCode installations. It
-prints one plan and asks for confirmation before downloading a runtime,
-invoking a system package manager, creating the host config, or installing the
-Agent Skill.
+The wizard diagnoses Microsandbox, QEMU, configured Cuttlefish artifacts,
+Android SDK Emulator tools/acceleration/AVD readiness, and local Codex, Claude
+Code, Cursor, Gemini CLI, and OpenCode installations. It prints one plan and
+asks for confirmation before downloading a runtime, invoking a system package
+manager, creating the host config, or installing the Agent Skill.
 When Microsandbox runtime files are missing, setup resolves GitHub's latest
 stable release at runtime and verifies the selected platform bundle against
 the release asset's published SHA-256. It never silently changes backends or
@@ -84,6 +87,7 @@ Explicit reconfiguration is available for scripts and less common layouts:
 asbx setup --default-backend microsandbox
 asbx setup --install-backend qemu
 asbx setup --install-backend cuttlefish
+asbx setup --install-backend android-emulator
 asbx setup --harness codex,claude-code
 asbx setup --no-harness
 asbx setup --yes
@@ -95,6 +99,9 @@ installed only when selected, using a detected system package manager after
 confirmation. Cuttlefish setup is verification-only: install its Linux host
 packages separately, extract a matching `cvd-host_package.tar.gz` and Android
 device-image archive into one directory, and set `cuttlefish.artifacts`.
+Android Emulator setup is also verification-only: install the Android SDK
+Emulator and platform-tools, create an AVD, and set `android_emulator.avd` (or
+pass `--android-avd` for each run).
 
 ## Usage
 
@@ -112,6 +119,12 @@ id="$(asbx open --project . --env node@22)"
 asbx exec "$id" -- npm ci
 asbx exec "$id" -- npm test
 asbx close "$id"
+
+# Cross-platform Android SDK Emulator. This always requires an explicit,
+# host-approved --network all because portable filtered isolation is unavailable.
+asbx doctor --backend android-emulator
+asbx run --android-avd TestPhone --project-mode none --network all -- \
+  getprop ro.build.version.release
 
 # Android Cuttlefish; --android-artifacts also implies --backend cuttlefish.
 asbx doctor --backend cuttlefish
@@ -187,6 +200,17 @@ devices. Host-gated `all` is also available; filtered modes, host mounts,
 published guest ports, and the wrapper restricted profile are rejected until
 they can be enforced honestly. Like QEMU, Cuttlefish lease expiry is reclaimed
 on the next `asbx` invocation rather than by a resident helper.
+
+Android Emulator also accepts project modes `none` and `copy` and uses the
+same Android guest workspace, artifact, and shell paths as Cuttlefish. Each
+sandbox receives a fresh wrapper-owned private AVD directory, cold-boots
+headlessly, uses a dedicated console/ADB pair and ADB server, and removes that
+state at cleanup without modifying the source AVD. Because the SDK Emulator
+does not provide a portable complete egress-disable primitive, the backend
+requires both an explicit `--network all` and
+`network.allow_all_mode = true`; filtered modes, host mounts, published guest
+ports, snapshots, OCI images, and the wrapper restricted profile are rejected.
+Emulator memory requests must be between 1536 MiB and 8192 MiB.
 
 `asbx debug` validates the session, loopback endpoint, symbol architecture,
 and debugger executable before attaching. It automatically selects LLDB on

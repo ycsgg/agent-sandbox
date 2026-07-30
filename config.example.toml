@@ -22,6 +22,16 @@ shutdown_timeout = "10s"
 boot_timeout = "5m"
 shutdown_timeout = "30s"
 
+[android_emulator]
+# sdk_root = "/Users/example/Library/Android/sdk"
+# emulator = "/Users/example/Library/Android/sdk/emulator/emulator"
+# adb = "/Users/example/Library/Android/sdk/platform-tools/adb"
+# avd = "TestPhone"
+boot_timeout = "5m"
+shutdown_timeout = "30s"
+# auto, host, software, swiftshader, swangle, or lavapipe
+gpu = "auto"
+
 [proxy]
 # Standard HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY values are inherited by default.
 inherit_env = true
@@ -39,7 +49,7 @@ rw_mount_quota = "2G"
 
 [network]
 default = "public"
-# Required only for an explicit Cuttlefish/QEMU --network all request.
+# Required for Android Emulator and explicit Cuttlefish/QEMU --network all.
 allow_all_mode = false
 allow_private_override = false
 allow_non_loopback_publish = false

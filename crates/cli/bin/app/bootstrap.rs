@@ -8,6 +8,9 @@ use std::{
 use agent_sandbox_core::AgentSandbox;
 use agent_sandbox_policy::{HostConfig, parse_duration};
 use agent_sandbox_runtime::{BackendId, RuntimeRegistry};
+use agent_sandbox_runtime_android_emulator::{
+    AndroidEmulatorRuntime, AndroidEmulatorRuntimeConfig,
+};
 use agent_sandbox_runtime_cuttlefish::{CuttlefishRuntime, CuttlefishRuntimeConfig};
 use agent_sandbox_runtime_msb::MicrosandboxRuntime;
 use agent_sandbox_runtime_qemu::{QemuRuntime, QemuRuntimeConfig};
@@ -55,6 +58,21 @@ impl Application {
             boot_timeout: parse_duration(&config.cuttlefish.boot_timeout)?,
             shutdown_timeout: parse_duration(&config.cuttlefish.shutdown_timeout)?,
         })?))?;
+        runtimes.register(Arc::new(AndroidEmulatorRuntime::new(
+            AndroidEmulatorRuntimeConfig {
+                home: state_path
+                    .parent()
+                    .unwrap_or(Path::new("."))
+                    .join("android-emulator"),
+                sdk_root: config.android_emulator.sdk_root.clone(),
+                emulator: config.android_emulator.emulator.clone(),
+                adb: config.android_emulator.adb.clone(),
+                avd: config.android_emulator.avd.clone(),
+                boot_timeout: parse_duration(&config.android_emulator.boot_timeout)?,
+                shutdown_timeout: parse_duration(&config.android_emulator.shutdown_timeout)?,
+                gpu: config.android_emulator.gpu.clone(),
+            },
+        )?))?;
         runtimes.validate()?;
 
         let runtimes = Arc::new(runtimes);

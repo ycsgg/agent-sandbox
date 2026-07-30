@@ -29,6 +29,10 @@ Select `--backend cuttlefish` (or pass `--android-artifacts`) only for Android
 phone-image workflows on a configured Linux KVM host. Cuttlefish supports ADB
 command, terminal, project-copy, and artifact-transfer workflows; it does not
 provide OCI environments or snapshots.
+Select `--backend android-emulator` (or pass `--android-avd NAME`) for a local
+Android SDK AVD on macOS, Windows, or Linux. It provides the same ADB command,
+terminal, project-copy, and artifact-transfer workflow, but requires explicit
+host-gated `--network all`.
 Check declared features with `asbx backend list --json`; use
 `asbx setup --check --no-harness` to verify that the configured backend is
 actually installed and ready.
@@ -69,7 +73,7 @@ host as a fallback. Diagnose the sandbox or ask the user how to proceed.
 - Pass only specific values with `--env-var KEY=VALUE`. Host environment
   variables and credentials are not inherited.
 - Write reports or build outputs that must leave the VM below `/out` on
-  Microsandbox/QEMU, or `/data/local/tmp/asbx/out` on Cuttlefish.
+  Microsandbox/QEMU, or `/data/local/tmp/asbx/out` on either Android backend.
 - Use `--user root` when package or OS installation requires guest root.
 
 ## One-shot
@@ -120,6 +124,25 @@ directory is not configured globally. Keep `--network off` unless unrestricted
 Android networking is genuinely required and host policy permits
 `--network all`. Cuttlefish does not support filtered network modes, project
 mounts, port publication, or `--security restricted`.
+
+## Android SDK Emulator
+
+```bash
+asbx doctor --backend android-emulator
+id="$(asbx open --android-avd TestPhone --project . --network all)"
+asbx exec "$id" -- ls /data/local/tmp/asbx/workspace
+asbx exec "$id" -- sh -c \
+  'getprop > /data/local/tmp/asbx/out/properties.txt'
+asbx artifact list "$id"
+asbx close "$id"
+```
+
+The source AVD is never run or modified directly; asbx cold-boots a private
+copy of its configuration with fresh data state. Use this backend only when
+the task genuinely permits unrestricted Android networking and the host has
+`network.allow_all_mode = true`. It rejects offline/filtered networking,
+project mounts, port publication, snapshots, OCI images, and
+`--security restricted`.
 
 Read [references/cli.md](references/cli.md) for command forms,
 [references/environments.md](references/environments.md) when auto detection is

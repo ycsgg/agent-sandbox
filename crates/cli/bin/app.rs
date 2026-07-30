@@ -180,7 +180,7 @@ struct OpenArgs {
 
 #[derive(Debug, Args)]
 struct CommonSandboxArgs {
-    /// Runtime backend. Machine boot options imply qemu; Android artifacts imply cuttlefish.
+    /// Runtime backend. Machine boot, Cuttlefish artifacts, and Android AVDs imply their backend.
     #[arg(long)]
     backend: Option<BackendId>,
     /// Project directory to copy or mount at the backend workspace path.
@@ -201,6 +201,9 @@ struct CommonSandboxArgs {
     /// Combined Cuttlefish host-tools and Android device-images directory.
     #[arg(long)]
     android_artifacts: Option<PathBuf>,
+    /// Source Android Virtual Device for the Android Emulator backend.
+    #[arg(long)]
+    android_avd: Option<String>,
     /// Bootable raw or qcow2 disk for the QEMU backend.
     #[arg(long)]
     root_disk: Option<PathBuf>,
@@ -487,6 +490,7 @@ enum SetupBackendArg {
     Microsandbox,
     Qemu,
     Cuttlefish,
+    AndroidEmulator,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
@@ -694,6 +698,36 @@ mod tests {
     }
 
     #[test]
+    fn android_avd_selects_emulator_with_explicit_network() {
+        let cli = Cli::try_parse_from([
+            "asbx",
+            "run",
+            "--android-avd",
+            "TestPhone",
+            "--network",
+            "all",
+            "--",
+            "getprop",
+            "ro.product.model",
+        ])
+        .unwrap();
+        let Command::Run(arguments) = cli.command else {
+            panic!("run command was not parsed");
+        };
+        let options = request::sandbox_options(arguments.sandbox).unwrap();
+        assert_eq!(options.backend, Some(BackendId::android_emulator()));
+        assert_eq!(options.android_avd.as_deref(), Some("TestPhone"));
+        assert_eq!(
+            options.network,
+            Some(agent_sandbox_runtime::NetworkMode::All)
+        );
+        assert_eq!(
+            options.project_mode,
+            agent_sandbox_runtime::ProjectMode::Copy
+        );
+    }
+
+    #[test]
     fn setup_accepts_repeatable_backends_and_harnesses() {
         let cli = Cli::try_parse_from([
             "asbx",
@@ -720,5 +754,24 @@ mod tests {
             [SetupHarnessArg::Codex, SetupHarnessArg::ClaudeCode]
         );
         assert!(arguments.yes);
+    }
+
+    #[test]
+    fn setup_accepts_android_emulator_backend() {
+        let cli = Cli::try_parse_from([
+            "asbx",
+            "setup",
+            "--install-backend",
+            "android-emulator",
+            "--check",
+        ])
+        .unwrap();
+        let Command::Setup(arguments) = cli.command else {
+            panic!("setup command was not parsed");
+        };
+        assert_eq!(
+            arguments.install_backends,
+            [SetupBackendArg::AndroidEmulator]
+        );
     }
 }

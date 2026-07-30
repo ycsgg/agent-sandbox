@@ -26,16 +26,22 @@ pub(super) fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOpt
         || arguments.accelerator.is_some()
         || !arguments.kernel_append.is_empty()
         || arguments.gdb.is_some();
-    let android_requested = arguments.android_artifacts.is_some();
-    if machine_requested && android_requested {
-        bail!("Android artifacts cannot be combined with QEMU machine boot options");
+    let cuttlefish_requested = arguments.android_artifacts.is_some();
+    let emulator_requested = arguments.android_avd.is_some();
+    let boot_source_count = usize::from(machine_requested)
+        + usize::from(cuttlefish_requested)
+        + usize::from(emulator_requested);
+    if boot_source_count > 1 {
+        bail!(
+            "QEMU machine boot options, Cuttlefish artifacts, and an Android Emulator AVD are mutually exclusive"
+        );
     }
-    let backend = match (arguments.backend, machine_requested, android_requested) {
-        (Some(backend), _, _) => Some(backend),
-        (None, true, false) => Some(BackendId::qemu()),
-        (None, false, true) => Some(BackendId::cuttlefish()),
-        (None, false, false) => None,
-        (None, true, true) => unreachable!("mixed boot inputs were rejected"),
+    let backend = match arguments.backend {
+        Some(backend) => Some(backend),
+        None if machine_requested => Some(BackendId::qemu()),
+        None if cuttlefish_requested => Some(BackendId::cuttlefish()),
+        None if emulator_requested => Some(BackendId::android_emulator()),
+        None => None,
     };
     if backend
         .as_ref()
@@ -44,12 +50,19 @@ pub(super) fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOpt
     {
         bail!("the qemu backend requires --root-disk and/or --kernel");
     }
-    if android_requested
+    if cuttlefish_requested
         && backend
             .as_ref()
             .is_some_and(|backend| backend.as_str() != BackendId::CUTTLEFISH)
     {
         bail!("--android-artifacts requires the cuttlefish backend");
+    }
+    if emulator_requested
+        && backend
+            .as_ref()
+            .is_some_and(|backend| backend.as_str() != BackendId::ANDROID_EMULATOR)
+    {
+        bail!("--android-avd requires the android-emulator backend");
     }
     if backend
         .as_ref()
@@ -57,6 +70,13 @@ pub(super) fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOpt
         && machine_requested
     {
         bail!("the cuttlefish backend cannot use QEMU machine boot options");
+    }
+    if backend
+        .as_ref()
+        .is_some_and(|backend| backend.as_str() == BackendId::ANDROID_EMULATOR)
+        && (machine_requested || cuttlefish_requested)
+    {
+        bail!("the android-emulator backend cannot use QEMU or Cuttlefish boot inputs");
     }
     if arguments.disk_format.is_some() && arguments.root_disk.is_none() {
         bail!("--disk-format requires --root-disk");
@@ -136,6 +156,7 @@ pub(super) fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOpt
         .as_deref()
         .map(|path| canonical_directory("Android artifacts", path))
         .transpose()?;
+    let android_avd = arguments.android_avd;
     let project_mode = match arguments.project_mode.unwrap_or(if machine_requested {
         ProjectModeArg::None
     } else {
@@ -242,6 +263,7 @@ pub(super) fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOpt
         backend,
         machine,
         android_artifacts,
+        android_avd,
         project: arguments.project,
         image: arguments.image,
         snapshot: arguments.snapshot,

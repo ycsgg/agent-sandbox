@@ -5,8 +5,8 @@
 ```bash
 asbx setup
 asbx setup --check [--json]
-asbx setup --default-backend microsandbox|qemu|cuttlefish
-asbx setup --install-backend microsandbox|qemu|cuttlefish
+asbx setup --default-backend microsandbox|qemu|cuttlefish|android-emulator
+asbx setup --install-backend microsandbox|qemu|cuttlefish|android-emulator
 asbx setup --harness codex,claude-code,cursor,gemini,opencode
 ```
 
@@ -30,8 +30,9 @@ Important options:
 - `--project PATH`
 - `--env auto|go@VERSION|rust@VERSION|node@VERSION`
 - `--image OCI_REF` or `--snapshot NAME`
-- `--backend microsandbox|qemu|cuttlefish`
+- `--backend microsandbox|qemu|cuttlefish|android-emulator`
 - `--android-artifacts PATH` (implies Cuttlefish)
+- `--android-avd NAME` (implies Android Emulator)
 - `--cpus N`, `--memory SIZE`, `--disk SIZE`
 - `--user USER`, `--security default|restricted`
 - `--project-mode none|copy|mount-ro|mount-rw`
@@ -126,6 +127,32 @@ Android guest paths differ from the POSIX VM backends:
 - artifacts: `/data/local/tmp/asbx/out`
 - default shell: `/system/bin/sh`
 
+## Android SDK Emulator
+
+```bash
+asbx doctor --backend android-emulator
+asbx run --android-avd TestPhone --project-mode none --network all -- \
+  getprop ro.build.version.release
+
+id="$(asbx open --backend android-emulator --android-avd TestPhone \
+  --project . --network all)"
+asbx exec "$id" -- ls /data/local/tmp/asbx/workspace
+asbx shell "$id"
+asbx close "$id"
+```
+
+The backend locates the SDK Emulator and ADB from explicit
+`android_emulator.*` paths, the SDK environment, `PATH`, or standard Android
+SDK locations. It runs on macOS, Windows, and Linux when the AVD architecture
+and host accelerator are compatible. Every sandbox uses fresh private AVD
+state, a headless cold boot, and dedicated console and ADB-server ports.
+
+Only `none` and `copy` project modes are supported. The SDK Emulator exposes
+guest networking through the host but has no portable complete-off or filtered
+egress mode, so every request must explicitly pass `--network all` and host
+configuration must enable `network.allow_all_mode`. Published ports,
+restricted security, OCI images, and wrapper snapshots are unavailable.
+
 ## Persistent sessions
 
 ```bash
@@ -164,7 +191,7 @@ asbx env list [--json]
 asbx env inspect NAME [--json]
 asbx env remove NAME
 asbx setup --check [--json]
-asbx doctor [--backend microsandbox|qemu|cuttlefish] [--json]
+asbx doctor [--backend microsandbox|qemu|cuttlefish|android-emulator] [--json]
 asbx backend list [--json]
 asbx cache status [--json]
 asbx cache prune [--max-size SIZE] [--older-than DURATION] \

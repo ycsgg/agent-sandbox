@@ -65,6 +65,8 @@ impl BackendId {
     pub const QEMU: &'static str = "qemu";
     /// Android Cuttlefish backend identifier.
     pub const CUTTLEFISH: &'static str = "cuttlefish";
+    /// Android SDK Emulator backend identifier.
+    pub const ANDROID_EMULATOR: &'static str = "android-emulator";
 
     /// Parse and validate a backend identifier.
     pub fn new(value: impl Into<String>) -> Result<Self> {
@@ -100,6 +102,11 @@ impl BackendId {
     /// Construct the Android Cuttlefish identifier.
     pub fn cuttlefish() -> Self {
         Self(Self::CUTTLEFISH.into())
+    }
+
+    /// Construct the Android SDK Emulator identifier.
+    pub fn android_emulator() -> Self {
+        Self(Self::ANDROID_EMULATOR.into())
     }
 }
 
@@ -138,6 +145,8 @@ pub enum BootSourceKind {
     DirectKernel,
     /// Extracted Android Cuttlefish host tools and device images.
     AndroidArtifacts,
+    /// Android Virtual Device managed by the Android SDK Emulator.
+    AndroidAvd,
 }
 
 /// Independently discoverable runtime operation.
@@ -302,6 +311,8 @@ pub enum RootSource {
     Machine(Box<MachineBootSpec>),
     /// An extracted Android Cuttlefish artifact directory.
     Android(Box<AndroidBootSpec>),
+    /// An Android SDK Virtual Device.
+    AndroidEmulator(Box<AndroidAvdSpec>),
 }
 
 /// Android Cuttlefish host tools and matching device-image inputs.
@@ -309,6 +320,13 @@ pub enum RootSource {
 pub struct AndroidBootSpec {
     /// Canonical directory containing `bin/launch_cvd`, `bin/adb`, and images.
     pub artifacts: PathBuf,
+}
+
+/// Android SDK Emulator AVD selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AndroidAvdSpec {
+    /// Source AVD name copied into wrapper-owned ephemeral state.
+    pub name: String,
 }
 
 /// QEMU-compatible virtual disk image format.

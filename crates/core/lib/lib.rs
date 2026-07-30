@@ -17,9 +17,10 @@ use agent_sandbox_environment::{
 };
 use agent_sandbox_policy::{EffectiveSpec, HostConfig, RequestedSpec};
 use agent_sandbox_runtime::{
-    AndroidBootSpec, BackendId, CreateSpec, DebugContext, ExecRequest, ExecStream, GuestLayout,
-    ImageInfo, MachineBootSpec, NetworkMode, NetworkRule, NetworkRuleAction, NetworkRuleTarget,
-    PortMapping, ProjectMode, RootSource, SandboxInfo, SandboxRuntime, SecurityMode, WorkspaceSpec,
+    AndroidAvdSpec, AndroidBootSpec, BackendId, CreateSpec, DebugContext, ExecRequest, ExecStream,
+    GuestLayout, ImageInfo, MachineBootSpec, NetworkMode, NetworkRule, NetworkRuleAction,
+    NetworkRuleTarget, PortMapping, ProjectMode, RootSource, SandboxInfo, SandboxRuntime,
+    SecurityMode, WorkspaceSpec,
 };
 use agent_sandbox_state::{
     EnvironmentRecord, ReservationRecord, SessionRecord, StateError, StateStore,
@@ -95,6 +96,8 @@ pub struct SandboxOptions {
     pub machine: Option<MachineBootSpec>,
     /// Combined Android Cuttlefish host-tools and device-images directory.
     pub android_artifacts: Option<PathBuf>,
+    /// Android SDK Emulator source AVD name.
+    pub android_avd: Option<String>,
     /// Project directory.
     pub project: PathBuf,
     /// Explicit OCI image.
@@ -1059,7 +1062,7 @@ impl AgentSandbox {
         }
 
         let destination = destination.as_ref();
-        let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+        let parent = destination_parent(destination);
         let canonical_parent = parent.canonicalize().map_err(|source| CoreError::Io {
             operation: "resolve artifact destination",
             path: parent.to_path_buf(),
@@ -1099,9 +1102,15 @@ impl AgentSandbox {
         detached: bool,
         persist_session: bool,
     ) -> Result<OpenedSandbox> {
+        if options.android_artifacts.is_some() && options.android_avd.is_some() {
+            return Err(CoreError::InvalidOperation(
+                "Cuttlefish artifacts cannot be combined with an Android Emulator AVD".into(),
+            ));
+        }
         let backend = match options.backend.clone() {
             Some(backend) => backend,
             None if options.android_artifacts.is_some() => BackendId::cuttlefish(),
+            None if options.android_avd.is_some() => BackendId::android_emulator(),
             None => BackendId::new(self.config.runtime.backend.clone())?,
         };
         let requested_network = options
@@ -1115,6 +1124,7 @@ impl AgentSandbox {
             && (options.image.is_some()
                 || options.snapshot.is_some()
                 || options.android_artifacts.is_some()
+                || options.android_avd.is_some()
                 || options
                     .environment
                     .as_deref()
@@ -1127,6 +1137,11 @@ impl AgentSandbox {
         if options.android_artifacts.is_some() && backend.as_str() != BackendId::CUTTLEFISH {
             return Err(CoreError::InvalidOperation(
                 "Android artifacts require the cuttlefish backend".into(),
+            ));
+        }
+        if options.android_avd.is_some() && backend.as_str() != BackendId::ANDROID_EMULATOR {
+            return Err(CoreError::InvalidOperation(
+                "an Android AVD requires the android-emulator backend".into(),
             ));
         }
         if backend.as_str() == BackendId::CUTTLEFISH
@@ -1143,8 +1158,32 @@ impl AgentSandbox {
                     .into(),
             ));
         }
+        if backend.as_str() == BackendId::ANDROID_EMULATOR
+            && (options.image.is_some()
+                || options.snapshot.is_some()
+                || options.machine.is_some()
+                || options.android_artifacts.is_some()
+                || options
+                    .environment
+                    .as_deref()
+                    .is_some_and(|value| value != "auto"))
+        {
+            return Err(CoreError::InvalidOperation(
+                "an Android Emulator AVD cannot be combined with Cuttlefish artifacts, machine boot, --image, --snapshot, or a non-auto --env"
+                    .into(),
+            ));
+        }
+        if backend.as_str() == BackendId::ANDROID_EMULATOR
+            && options.network != Some(NetworkMode::All)
+        {
+            return Err(CoreError::InvalidOperation(
+                "the android-emulator backend requires an explicit --network all request and host allow_all_mode approval"
+                    .into(),
+            ));
+        }
         let named_environment = if options.machine.is_none()
             && options.android_artifacts.is_none()
+            && options.android_avd.is_none()
             && options.image.is_none()
             && options.snapshot.is_none()
         {
@@ -1171,6 +1210,26 @@ impl AgentSandbox {
                     root: RootSource::Android(Box::new(AndroidBootSpec { artifacts })),
                     detection: None,
                     source: "Android Cuttlefish artifacts".into(),
+                },
+                None,
+            )
+        } else if backend.as_str() == BackendId::ANDROID_EMULATOR {
+            let name = options
+                .android_avd
+                .or_else(|| self.config.android_emulator.avd.clone())
+                .ok_or_else(|| {
+                    CoreError::InvalidOperation(
+                        "the android-emulator backend requires --android-avd or android_emulator.avd"
+                            .into(),
+                    )
+                })?;
+            (
+                ResolvedEnvironment {
+                    root: RootSource::AndroidEmulator(Box::new(AndroidAvdSpec {
+                        name: name.clone(),
+                    })),
+                    detection: None,
+                    source: format!("Android Emulator AVD {name:?}"),
                 },
                 None,
             )
@@ -1601,6 +1660,13 @@ fn guest_child_path(artifact_root: &str, parent: &str, entry_path: &str) -> Resu
     Ok(path)
 }
 
+fn destination_parent(destination: &Path) -> &Path {
+    destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 fn validate_artifact_path(path: &str, artifact_root: &str) -> Result<()> {
     let prefix = format!("{}/", artifact_root.trim_end_matches('/'));
     let relative = path.strip_prefix(&prefix).unwrap_or_default();
@@ -1637,6 +1703,9 @@ fn root_description(resolved: &ResolvedEnvironment) -> String {
         ),
         RootSource::Android(android) => {
             format!("android:{}", android.artifacts.display())
+        }
+        RootSource::AndroidEmulator(android) => {
+            format!("android-avd:{}", android.name)
         }
         _ => "backend-defined".into(),
     }
@@ -1994,6 +2063,7 @@ mod tests {
                 backend: Some(BackendId::microsandbox()),
                 machine: None,
                 android_artifacts: None,
+                android_avd: None,
                 project,
                 image: Some("alpine:3.22".into()),
                 snapshot: None,
@@ -2052,6 +2122,15 @@ mod tests {
                 "{rejected}"
             );
         }
+    }
+
+    #[test]
+    fn bare_artifact_destination_uses_the_current_directory() {
+        assert_eq!(destination_parent(Path::new("report.txt")), Path::new("."));
+        assert_eq!(
+            destination_parent(Path::new("reports/report.txt")),
+            Path::new("reports")
+        );
     }
 
     #[tokio::test]
@@ -2357,11 +2436,50 @@ mod tests {
         assert!(runtime.state.lock().unwrap().removed_images.is_empty());
     }
 
+    #[tokio::test]
+    async fn android_emulator_requires_explicit_network_and_host_approval() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let service = AgentSandbox::new(
+            Arc::new(MockRuntime::default()),
+            StateStore::open(root.path().join("state.db")).unwrap(),
+            HostConfig::default(),
+            root.path(),
+        )
+        .unwrap();
+        let mut requested = options(&project, ProjectMode::None);
+        requested.backend = Some(BackendId::android_emulator());
+        requested.android_avd = Some("TestPhone".into());
+        requested.image = None;
+        requested.security = SecurityMode::Default;
+        requested.network = None;
+
+        let error = service
+            .create_one_shot(requested.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires an explicit --network all")
+        );
+
+        requested.network = Some(NetworkMode::All);
+        let error = service.create_one_shot(requested).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("network mode 'all' is disabled by host configuration")
+        );
+    }
+
     fn options(project: &Path, project_mode: ProjectMode) -> SandboxOptions {
         SandboxOptions {
             backend: Some(BackendId::microsandbox()),
             machine: None,
             android_artifacts: None,
+            android_avd: None,
             project: project.into(),
             image: Some("alpine:3.22".into()),
             snapshot: None,

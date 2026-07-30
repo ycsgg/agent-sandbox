@@ -12,7 +12,7 @@ asbx setup
 The first command is read-only and reports the exact repair plan. The second
 asks for confirmation before installing or changing anything. For detailed
 backend diagnostics, run `asbx doctor` or select one backend with
-`--backend qemu` or `--backend cuttlefish`.
+`--backend qemu`, `--backend cuttlefish`, or `--backend android-emulator`.
 Resolve failed virtualization, `msb`, or `libkrunfw` checks. Do not run the
 project command on the host as a fallback.
 
@@ -28,6 +28,11 @@ configured as `cuttlefish.artifacts`. Offline mode additionally needs host
 tools that expose `--enable_tap_devices`; use a 2025-03 or newer matching
 build. `asbx setup` diagnoses these inputs but does not download Android
 artifacts or install the privileged host packages.
+
+For Android Emulator, install the SDK Emulator, platform-tools, and a system
+image, then create an AVD with Android Studio or `avdmanager`. Set
+`android_emulator.avd` or pass `--android-avd NAME`. Doctor reports the
+resolved binaries, acceleration result, and available/configured AVDs.
 
 ## QEMU starts but guest commands are unavailable
 
@@ -52,6 +57,21 @@ Host tools and phone images must come from the same Android build. Confirm that
 no external Cuttlefish instance owns the reported ADB port, and that the Linux
 user has the access installed by the Cuttlefish host packages. Android user
 builds might not provide `su`; omit `--user root` or use a userdebug image.
+
+## Android Emulator does not boot
+
+Run:
+
+```bash
+asbx doctor --backend android-emulator --json
+```
+
+Confirm that the configured AVD exists, matches the host architecture, and
+that Hypervisor.Framework (macOS), WHPX (Windows), or KVM (Linux) is usable.
+Inspect `asbx inspect ID --json` for the private AVD name and console/ADB
+ports, then inspect `emulator.log` below the backend state directory. A Google
+Play/user image may not provide `su`; omit `--user root`. Stale sessions are
+reclaimed by `asbx close ID` or the next lease reconciliation.
 
 ## QEMU debugger does not attach
 
@@ -121,9 +141,9 @@ asbx close ID
 ```
 
 Every `asbx` invocation also reconciles expired wrapper leases. Microsandbox's
-runtime maximum duration is a second cleanup backstop. QEMU and Cuttlefish do
-not install a persistent TTL helper, so an expired full-system VM is reclaimed
-by the next `asbx` invocation.
+runtime maximum duration is a second cleanup backstop. QEMU, Cuttlefish, and
+Android Emulator do not install a persistent TTL helper, so an expired
+full-system VM is reclaimed by the next `asbx` invocation.
 
 ## Artifact download is rejected
 
@@ -133,6 +153,6 @@ the destination is inside an authorized workspace root:
 ```bash
 asbx artifact list ID
 asbx artifact get ID /out/report.json --to ./report.json
-# Cuttlefish:
+# Either Android backend:
 asbx artifact get ID /data/local/tmp/asbx/out/report.json --to ./report.json
 ```

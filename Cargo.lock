@@ -26,6 +26,7 @@ dependencies = [
  "agent-sandbox-exec",
  "agent-sandbox-policy",
  "agent-sandbox-runtime",
+ "agent-sandbox-runtime-android-emulator",
  "agent-sandbox-runtime-cuttlefish",
  "agent-sandbox-runtime-msb",
  "agent-sandbox-runtime-qemu",
@@ -130,6 +131,23 @@ dependencies = [
  "serde",
  "thiserror 2.0.19",
  "tokio",
+]
+
+[[package]]
+name = "agent-sandbox-runtime-android-emulator"
+version = "0.1.0"
+dependencies = [
+ "agent-sandbox-runtime",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "dirs",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+ "which",
 ]
 
 [[package]]

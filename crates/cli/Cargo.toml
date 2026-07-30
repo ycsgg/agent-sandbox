@@ -15,6 +15,7 @@ agent-sandbox-core.workspace = true
 agent-sandbox-exec.workspace = true
 agent-sandbox-policy.workspace = true
 agent-sandbox-runtime.workspace = true
+agent-sandbox-runtime-android-emulator.workspace = true
 agent-sandbox-runtime-cuttlefish.workspace = true
 agent-sandbox-runtime-msb.workspace = true
 agent-sandbox-runtime-qemu.workspace = true

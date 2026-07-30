@@ -8,16 +8,19 @@
 - 使用预置环境、任意 OCI 镜像或 Microsandbox snapshot。
 - 使用 QEMU 启动磁盘镜像、自定义 kernel/initrd/DTB 和不同 CPU 架构。
 - 使用 Cuttlefish 启动 Android phone image，并通过 ADB 执行命令和传输文件。
+- 使用 Android SDK Emulator 在 macOS、Windows 和 Linux 上启动现有 AVD。
 - 创建一次性 sandbox，执行编译、测试、审计和验证命令。
 - 在同一个 sandbox 中进行多轮操作。
 - 启动服务并通过宿主本地端口访问。
 - 取回报告、日志和构建产物。
 - 完成后销毁 sandbox，不留下常驻 VM 或 daemon。
 
-底层通过 backend registry 同时支持 Microsandbox、QEMU 和 Cuttlefish。
+底层通过 backend registry 同时支持 Microsandbox、QEMU、Cuttlefish 和
+Android Emulator。
 Microsandbox 负责快速 OCI 工作流；QEMU 负责完整系统启动、跨架构、串口、
 QMP 和 GDB stub；Cuttlefish 负责 Linux/KVM 上的 Android phone image 与
-ADB 通道。上层 core、lease 和状态模型不与任一 backend 强耦合。
+ADB 通道；Android Emulator 负责基于本机 Android SDK AVD 的跨平台 Android
+工作流。上层 core、lease 和状态模型不与任一 backend 强耦合。
 
 ## 2. 威胁模型
 
@@ -29,7 +32,8 @@ ADB 通道。上层 core、lease 和状态模型不与任一 backend 强耦合�
 - AI Agent 及其决策。
 - Agent Sandbox wrapper。
 - 由我们维护的基础镜像、环境目录和 provisioning 脚本。
-- Microsandbox、libkrun、QEMU、Cuttlefish、宿主 hypervisor 和宿主内核。
+- Microsandbox、libkrun、QEMU、Cuttlefish、Android Emulator、宿主
+  hypervisor 和宿主内核。
 
 Agent 可以自由选择命令、镜像、网络模式、guest 用户、资源和环境构建方式。wrapper 不需要防止一个主动恶意的 Agent 绕过产品意图。
 
@@ -81,7 +85,8 @@ Agent Sandbox Core
 Runtime Registry
    ├── Microsandbox SDK → libkrun → KVM / Hypervisor.framework / WHP
    ├── QEMU → KVM / HVF / WHPX / TCG
-   └── Cuttlefish → crosvm / KVM → Android + ADB
+   ├── Cuttlefish → crosvm / KVM → Android + ADB
+   └── Android Emulator → KVM / Hypervisor.Framework / WHPX → Android + ADB
 ```
 
 不引入 MCP server，原因如下：
@@ -100,6 +105,8 @@ Skill 是使用说明和工作流，不承担强制隔离。即使 Agent 没有�
 adapter 调用系统安装的 `qemu-system-*`，使用 QMP 管理生命周期，使用可选
 SSH transport 提供命令和文件通道。Cuttlefish adapter 使用匹配的
 host-tool/device-image 目录启动独立 instance，以 ADB 提供命令与文件通道。
+Android Emulator adapter 从已有 AVD 生成 wrapper 私有的临时配置和数据目录，
+以 headless cold boot 启动，并为每个 sandbox 分配独立 console/ADB 端口。
 
 只在出现 wrapper 无法解决的 core 问题时维护小型 patch branch，并优先向上游提交：
 
@@ -486,6 +493,11 @@ global reserved RAM   configurable
 | `all` | Microsandbox allow-all；明确标记高风险 |
 | `rules` | Agent 传入自定义 domain/CIDR/port 规则 |
 
+这些是 wrapper 的统一请求模型，不代表每个 backend 都能诚实实施所有模式。
+Android Emulator 缺少跨平台、可验证的完全断网或过滤接口，因此只接受调用方
+显式请求且宿主允许的 `all`；不能实施的 `off/public/dependencies/rules`
+会直接拒绝，不做静默降级。
+
 示例：
 
 ```bash
@@ -607,6 +619,8 @@ Codex、Claude Code、Cursor、Gemini CLI、OpenCode 等 harness，再展示唯�
 --env auto|NAME|LANG@VERSION
 --image OCI_REF
 --snapshot NAME
+--android-artifacts PATH
+--android-avd NAME
 --cpus N
 --memory SIZE
 --disk SIZE
@@ -650,6 +664,7 @@ agent-sandbox/
 │   ├── runtime-msb/   # Microsandbox adapter
 │   ├── runtime-qemu/  # QEMU/QMP/SSH adapter
 │   ├── runtime-cuttlefish/ # Android Cuttlefish/ADB adapter
+│   ├── runtime-android-emulator/ # Android SDK Emulator/ADB adapter
 │   ├── transfer/      # project/artifact broker
 │   ├── exec/          # streaming、timeout、output
 │   ├── state/         # SQLite、lease、reaper
@@ -718,7 +733,7 @@ trait CommandRuntime {
    `asbx debug`，无需增加 backend 名称分支或解析私有 metadata。
 
 `GuestLayout` 让 core 不再假定所有 guest 都使用 `/workspace`、`/out` 和
-`/bin/sh`。Cuttlefish 对应的路径分别是
+`/bin/sh`。Cuttlefish 和 Android Emulator 对应的路径分别是
 `/data/local/tmp/asbx/workspace`、`/data/local/tmp/asbx/out` 和
 `/system/bin/sh`。
 
@@ -782,6 +797,15 @@ shutdown_timeout = "10s"
 # artifacts = "/opt/android/cuttlefish"
 boot_timeout = "5m"
 shutdown_timeout = "30s"
+
+[android_emulator]
+# sdk_root = "/Users/example/Library/Android/sdk"
+# emulator = "/Users/example/Library/Android/sdk/emulator/emulator"
+# adb = "/Users/example/Library/Android/sdk/platform-tools/adb"
+# avd = "TestPhone"
+boot_timeout = "5m"
+shutdown_timeout = "30s"
+gpu = "auto"
 
 [proxy]
 inherit_env = true
@@ -909,6 +933,8 @@ stop guest
 - Linux x86_64/arm64 CI。（已配置）
 - macOS arm64 CI。（已配置）
 - Windows x86_64/arm64 CI。（已配置）
+- Cuttlefish Android backend。（已实现，Linux/KVM）
+- Android Emulator backend。（已实现，macOS/Windows/Linux）
 - 父进程崩溃、宿主重启和强制 kill 测试。
 - 性能基准和长时间稳定性测试。
 
@@ -968,6 +994,8 @@ Agent Sandbox Core
 Runtime Backends
   Microsandbox 负责 OCI、guest agent、精细网络和文件系统设备
   QEMU 负责完整系统、跨架构、串口、QMP 和 GDB stub
+  Cuttlefish 负责 Linux/KVM 上的 AOSP/CVD Android
+  Android Emulator 负责 macOS、Windows、Linux 上的 SDK AVD
 ```
 
 核心体验是“自由但有宿主边界”：

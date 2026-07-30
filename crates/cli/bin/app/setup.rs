@@ -11,6 +11,9 @@ use std::{
 
 use agent_sandbox_policy::{HostConfig, parse_duration};
 use agent_sandbox_runtime::SandboxRuntime;
+use agent_sandbox_runtime_android_emulator::{
+    AndroidEmulatorRuntime, AndroidEmulatorRuntimeConfig,
+};
 use agent_sandbox_runtime_cuttlefish::{CuttlefishRuntime, CuttlefishRuntimeConfig};
 use agent_sandbox_runtime_msb::MicrosandboxRuntime;
 use agent_sandbox_runtime_qemu::{QemuRuntime, QemuRuntimeConfig};
@@ -240,7 +243,7 @@ pub(super) async fn run(config_argument: Option<&Path>, arguments: SetupArgs) ->
 
     if !is_known_backend(&target_default) {
         blockers.push(format!(
-            "configured default backend {target_default:?} is unknown; rerun with --default-backend microsandbox, qemu, or cuttlefish"
+            "configured default backend {target_default:?} is unknown; rerun with --default-backend microsandbox, qemu, cuttlefish, or android-emulator"
         ));
     } else if !config_path.exists() || config.runtime.backend != target_default {
         actions.push(Action::WriteConfig {
@@ -375,6 +378,15 @@ async fn probe_backends(config: &HostConfig) -> Result<Vec<BackendProbe>> {
     let cuttlefish_ready = checks_pass(&cuttlefish_checks);
     let cuttlefish_missing = config.cuttlefish.artifacts.is_none();
 
+    let android_emulator_runtime = android_emulator_runtime(config)?;
+    let android_emulator_checks = android_emulator_runtime
+        .doctor()
+        .await
+        .context("diagnose Android Emulator")?;
+    let android_emulator_ready =
+        checks_pass(&android_emulator_checks) && config.android_emulator.avd.is_some();
+    let android_emulator_missing = config.android_emulator.avd.is_none();
+
     Ok(vec![
         BackendProbe {
             view: BackendView {
@@ -404,6 +416,16 @@ async fn probe_backends(config: &HostConfig) -> Result<Vec<BackendProbe>> {
                 detail: checks_detail(&cuttlefish_checks),
             },
             missing_runtime: cuttlefish_missing,
+            install_can_fix: false,
+        },
+        BackendProbe {
+            view: BackendView {
+                id: SetupBackendArg::AndroidEmulator.as_str().into(),
+                status: backend_status(android_emulator_ready, android_emulator_missing),
+                selected: false,
+                detail: checks_detail(&android_emulator_checks),
+            },
+            missing_runtime: android_emulator_missing,
             install_can_fix: false,
         },
     ])
@@ -483,6 +505,16 @@ async fn plan_backends(
             )),
             "cuttlefish" => blockers.push(format!(
                 "Cuttlefish is configured but not ready: {}",
+                probe.view.detail
+            )),
+            "android-emulator" if probe.missing_runtime => blockers.push(format!(
+                "Android Emulator has no default AVD configured: {}. Install the Android SDK \
+                 Emulator and a system image, create an AVD, then set android_emulator.avd in \
+                 the host config",
+                probe.view.detail
+            )),
+            "android-emulator" => blockers.push(format!(
+                "Android Emulator is configured but not ready: {}",
                 probe.view.detail
             )),
             _ => blockers.push(format!("backend {backend:?} cannot be prepared")),
@@ -671,6 +703,23 @@ fn cuttlefish_runtime(config: &HostConfig) -> Result<CuttlefishRuntime> {
     })?)
 }
 
+fn android_emulator_runtime(config: &HostConfig) -> Result<AndroidEmulatorRuntime> {
+    let home = env::var_os("ASBX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".agent-sandbox")))
+        .context("cannot determine ASBX_HOME")?;
+    Ok(AndroidEmulatorRuntime::new(AndroidEmulatorRuntimeConfig {
+        home: home.join("android-emulator"),
+        sdk_root: config.android_emulator.sdk_root.clone(),
+        emulator: config.android_emulator.emulator.clone(),
+        adb: config.android_emulator.adb.clone(),
+        avd: config.android_emulator.avd.clone(),
+        boot_timeout: parse_duration(&config.android_emulator.boot_timeout)?,
+        shutdown_timeout: parse_duration(&config.android_emulator.shutdown_timeout)?,
+        gpu: config.android_emulator.gpu.clone(),
+    })?)
+}
+
 fn qemu_binary(config: &HostConfig) -> Option<PathBuf> {
     let architecture = match env::consts::ARCH {
         "x86" | "x86_64" => "x86_64",
@@ -792,6 +841,7 @@ impl SetupBackendArg {
             Self::Microsandbox => "microsandbox",
             Self::Qemu => "qemu",
             Self::Cuttlefish => "cuttlefish",
+            Self::AndroidEmulator => "android-emulator",
         }
     }
 }
@@ -915,7 +965,10 @@ fn microsandbox_install_can_fix(checks: &[(String, bool, String)]) -> bool {
 }
 
 fn is_known_backend(backend: &str) -> bool {
-    matches!(backend, "microsandbox" | "qemu" | "cuttlefish")
+    matches!(
+        backend,
+        "microsandbox" | "qemu" | "cuttlefish" | "android-emulator"
+    )
 }
 
 fn checks_pass(checks: &[(String, bool, String)]) -> bool {
@@ -944,7 +997,7 @@ fn checks_detail(checks: &[(String, bool, String)]) -> String {
     }
     checks
         .iter()
-        .take(3)
+        .take(4)
         .map(|(name, _, detail)| format!("{name}: {detail}"))
         .collect::<Vec<_>>()
         .join("; ")
