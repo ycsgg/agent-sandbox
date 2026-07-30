@@ -185,6 +185,12 @@ fn detect_rust(
                 Ok(value) => value
                     .get("package")
                     .and_then(|package| package.get("rust-version"))
+                    .or_else(|| {
+                        value
+                            .get("workspace")
+                            .and_then(|workspace| workspace.get("package"))
+                            .and_then(|package| package.get("rust-version"))
+                    })
                     .and_then(toml::Value::as_str)
                     .map(clean_version),
                 Err(error) => {
@@ -216,19 +222,20 @@ fn detect_node(
     warnings: &mut Vec<String>,
 ) {
     let has_package = project.join("package.json").is_file();
-    let has_typescript = project.join("tsconfig.json").is_file()
-        || project.join("tsconfig.base.json").is_file()
-        || project.join("deno.json").is_file();
-    if !has_package && !has_typescript && !project.join(".nvmrc").is_file() {
+    let typescript_source = typescript_declaration(project);
+    let has_typescript = typescript_source.is_some();
+    let has_nvmrc = project.join(".nvmrc").is_file();
+    let has_node_version = project.join(".node-version").is_file();
+    if !has_package && !has_typescript && !has_nvmrc && !has_node_version {
         return;
     }
 
     let mut package_manager = None;
-    let (source, version) = if project.join(".nvmrc").is_file() {
+    let (source, version) = if has_nvmrc {
         let source = ".nvmrc";
         let version = first_nonempty(project, source, warnings).map(|value| clean_version(&value));
         (source, version)
-    } else if project.join(".node-version").is_file() {
+    } else if has_node_version {
         let source = ".node-version";
         let version = first_nonempty(project, source, warnings).map(|value| clean_version(&value));
         (source, version)
@@ -256,7 +263,10 @@ fn detect_node(
             );
         (source, version)
     } else {
-        ("tsconfig.json", None)
+        (
+            typescript_source.as_deref().unwrap_or("tsconfig.json"),
+            None,
+        )
     };
 
     languages.push(Language {
@@ -298,6 +308,26 @@ fn detect_node(
             },
         );
     }
+}
+
+fn typescript_declaration(project: &Path) -> Option<String> {
+    for source in ["tsconfig.json", "tsconfig.base.json", "deno.json"] {
+        if project.join(source).is_file() {
+            return Some(source.into());
+        }
+    }
+
+    let mut candidates = fs::read_dir(project)
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (name.starts_with("tsconfig") && name.ends_with(".json") && entry.path().is_file())
+                .then_some(name)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next()
 }
 
 fn read_limited(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
@@ -422,6 +452,45 @@ mod tests {
             detection.suggested_environment.as_deref(),
             Some("node@22.1")
         );
+    }
+
+    #[test]
+    fn detects_workspace_rust_version() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers = []\n\n[workspace.package]\nrust-version = \"1.94\"\n",
+        )
+        .unwrap();
+
+        let detection = detect(dir.path()).unwrap();
+        assert_eq!(detection.languages[0].name, "rust");
+        assert_eq!(detection.languages[0].version.as_deref(), Some("1.94"));
+        assert_eq!(
+            detection.suggested_environment.as_deref(),
+            Some("rust@1.94")
+        );
+    }
+
+    #[test]
+    fn detects_standalone_node_version_file() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".node-version"), "22.14.0\n").unwrap();
+
+        let detection = detect(dir.path()).unwrap();
+        assert_eq!(detection.languages[0].name, "node");
+        assert_eq!(detection.languages[0].version.as_deref(), Some("22.14.0"));
+        assert_eq!(detection.languages[0].source, ".node-version");
+    }
+
+    #[test]
+    fn detects_prefixed_typescript_declaration() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("tsconfig.app.json"), "{}").unwrap();
+
+        let detection = detect(dir.path()).unwrap();
+        assert_eq!(detection.languages[0].name, "typescript");
+        assert_eq!(detection.languages[0].source, "tsconfig.app.json");
     }
 
     #[test]

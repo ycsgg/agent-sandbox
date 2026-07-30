@@ -26,10 +26,16 @@ pub(super) fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOpt
         || arguments.accelerator.is_some()
         || !arguments.kernel_append.is_empty()
         || arguments.gdb.is_some();
-    let backend = match (arguments.backend, machine_requested) {
-        (Some(backend), _) => Some(backend),
-        (None, true) => Some(BackendId::qemu()),
-        (None, false) => None,
+    let android_requested = arguments.android_artifacts.is_some();
+    if machine_requested && android_requested {
+        bail!("Android artifacts cannot be combined with QEMU machine boot options");
+    }
+    let backend = match (arguments.backend, machine_requested, android_requested) {
+        (Some(backend), _, _) => Some(backend),
+        (None, true, false) => Some(BackendId::qemu()),
+        (None, false, true) => Some(BackendId::cuttlefish()),
+        (None, false, false) => None,
+        (None, true, true) => unreachable!("mixed boot inputs were rejected"),
     };
     if backend
         .as_ref()
@@ -37,6 +43,20 @@ pub(super) fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOpt
         && !machine_requested
     {
         bail!("the qemu backend requires --root-disk and/or --kernel");
+    }
+    if android_requested
+        && backend
+            .as_ref()
+            .is_some_and(|backend| backend.as_str() != BackendId::CUTTLEFISH)
+    {
+        bail!("--android-artifacts requires the cuttlefish backend");
+    }
+    if backend
+        .as_ref()
+        .is_some_and(|backend| backend.as_str() == BackendId::CUTTLEFISH)
+        && machine_requested
+    {
+        bail!("the cuttlefish backend cannot use QEMU machine boot options");
     }
     if arguments.disk_format.is_some() && arguments.root_disk.is_none() {
         bail!("--disk-format requires --root-disk");
@@ -111,6 +131,11 @@ pub(super) fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOpt
     } else {
         None
     };
+    let android_artifacts = arguments
+        .android_artifacts
+        .as_deref()
+        .map(|path| canonical_directory("Android artifacts", path))
+        .transpose()?;
     let project_mode = match arguments.project_mode.unwrap_or(if machine_requested {
         ProjectModeArg::None
     } else {
@@ -202,14 +227,21 @@ pub(super) fn sandbox_options(arguments: CommonSandboxArgs) -> Result<SandboxOpt
             NetworkArg::Rules => NetworkMode::Rules,
             NetworkArg::All => NetworkMode::All,
         })
-        .or(if machine_requested {
-            Some(NetworkMode::Off)
-        } else {
-            None
-        });
+        .or(
+            if machine_requested
+                || backend
+                    .as_ref()
+                    .is_some_and(|backend| backend.as_str() == BackendId::CUTTLEFISH)
+            {
+                Some(NetworkMode::Off)
+            } else {
+                None
+            },
+        );
     Ok(SandboxOptions {
         backend,
         machine,
+        android_artifacts,
         project: arguments.project,
         image: arguments.image,
         snapshot: arguments.snapshot,
@@ -261,6 +293,16 @@ fn canonical_input(label: &str, path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("cannot resolve {label} {}", path.display()))?;
     if !path.is_file() {
         bail!("{label} {} is not a regular file", path.display());
+    }
+    Ok(path)
+}
+
+fn canonical_directory(label: &str, path: &Path) -> Result<PathBuf> {
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {label} {}", path.display()))?;
+    if !path.is_dir() {
+        bail!("{label} {} is not a directory", path.display());
     }
     Ok(path)
 }

@@ -16,21 +16,32 @@ use super::{
     ArtifactCommand, BackendCommand, CacheCommand, Cli, Command, EnvCommand, EnvCreateArgs,
     MetadataOutput, OutputArg, RunArgs, SessionExecArgs,
     bootstrap::Application,
+    proxy,
     request::{exec_request, sandbox_options},
+    setup,
 };
 
 pub(super) async fn run(cli: Cli) -> Result<i32> {
+    let Cli {
+        config, command, ..
+    } = cli;
+    let command = match command {
+        Command::Setup(arguments) => return setup::run(config.as_deref(), arguments).await,
+        command => command,
+    };
     let Application {
         service,
         runtimes,
         default_backend,
         state_path,
-    } = Application::load(cli.config).await?;
+    } = Application::load(config).await?;
 
-    match cli.command {
+    match command {
+        Command::Setup(_) => unreachable!("setup returned before application bootstrap"),
         Command::Doctor { backend, json } => {
             let backend = backend.unwrap_or(default_backend);
-            let checks = runtimes.doctor_backend(&backend).await?;
+            let mut checks = runtimes.doctor_backend(&backend).await?;
+            checks.extend(proxy::doctor_checks(service.config())?);
             if json {
                 let values: Vec<_> = checks
                     .iter()
@@ -90,7 +101,8 @@ pub(super) async fn run(cli: Cli) -> Result<i32> {
         }
         Command::Exec(arguments) => run_session_exec(&service, arguments).await,
         Command::Shell(arguments) => {
-            service.require_session(&arguments.id)?;
+            let session = service.require_session(&arguments.id)?;
+            let layout = service.guest_layout(&session.backend)?;
             if !std::io::stdin().is_terminal() {
                 bail!("shell requires an interactive terminal");
             }
@@ -98,9 +110,9 @@ pub(super) async fn run(cli: Cli) -> Result<i32> {
                 .attach(
                     &arguments.id,
                     ExecRequest {
-                        command: arguments.shell,
+                        command: arguments.shell.unwrap_or(layout.shell),
                         args: vec![],
-                        cwd: Some(arguments.cwd),
+                        cwd: Some(arguments.cwd.unwrap_or(session.default_cwd)),
                         user: arguments.user,
                         env: vec![],
                         timeout: None,
@@ -463,19 +475,9 @@ async fn create_environment(service: &AgentSandbox, arguments: EnvCreateArgs) ->
 async fn run_one_shot(service: &AgentSandbox, arguments: RunArgs) -> Result<i32> {
     let output = arguments.output;
     let options = sandbox_options(arguments.sandbox)?;
-    let cwd = if options.project_mode == ProjectMode::None {
-        "/"
-    } else {
-        "/workspace"
-    };
-    let command = exec_request(
-        arguments.command,
-        Some(cwd.into()),
-        None,
-        options.env.clone(),
-        options.timeout,
-        false,
-    )?;
+    let project_mode = options.project_mode;
+    let command_environment = options.env.clone();
+    let command_timeout = options.timeout;
     let opened = service.create_one_shot(options).await?;
     if output == OutputArg::Jsonl {
         println!(
@@ -483,7 +485,20 @@ async fn run_one_shot(service: &AgentSandbox, arguments: RunArgs) -> Result<i32>
             serde_json::json!({"type":"sandbox.ready","id":opened.id,"root":opened.root})
         );
     }
+    let cwd = if project_mode == ProjectMode::None {
+        opened.guest_layout.root.clone()
+    } else {
+        opened.guest_layout.workspace.clone()
+    };
     let result = async {
+        let command = exec_request(
+            arguments.command,
+            Some(cwd),
+            None,
+            command_environment,
+            command_timeout,
+            false,
+        )?;
         let stream = service.exec(&opened.id, command).await?;
         consume_output(stream, output, opened.memory_tail_bytes).await
     }
@@ -512,11 +527,11 @@ async fn run_one_shot(service: &AgentSandbox, arguments: RunArgs) -> Result<i32>
 }
 
 async fn run_session_exec(service: &AgentSandbox, arguments: SessionExecArgs) -> Result<i32> {
-    service.require_session(&arguments.id)?;
+    let session = service.require_session(&arguments.id)?;
     let output = arguments.output;
     let request = exec_request(
         arguments.command,
-        Some(arguments.cwd),
+        Some(arguments.cwd.unwrap_or(session.default_cwd)),
         arguments.user,
         arguments.env_vars,
         arguments.timeout,

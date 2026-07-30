@@ -6,4 +6,4 @@ if ! command -v asbx >/dev/null 2>&1; then
   exit 127
 fi
 
-asbx doctor
+asbx setup --check --no-harness

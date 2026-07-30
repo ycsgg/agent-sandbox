@@ -10,7 +10,9 @@ install hooks, build scripts, tests, or downloaded binaries.
 
 ## Choose a workflow
 
-1. Run `scripts/check-asbx.sh` if runtime readiness is unknown.
+1. Run `scripts/check-asbx.sh` if runtime readiness is unknown. If it fails,
+   use `asbx setup` for an interactive repair or `asbx setup --check --json`
+   for a machine-readable plan.
 2. Run `asbx env detect --project . --json` before choosing an environment.
 3. Use `asbx run` for one command. It creates, streams, and removes one VM.
 4. Use `open → exec → close` for dependency installation, multiple commands,
@@ -23,7 +25,13 @@ install hooks, build scripts, tests, or downloaded binaries.
 Use the default Microsandbox backend for OCI images and project workflows.
 Select `--backend qemu` only when the task supplies a bootable disk or kernel
 and needs full-system, cross-architecture, serial, QMP, or GDB capabilities.
-Check available features with `asbx backend list --json`.
+Select `--backend cuttlefish` (or pass `--android-artifacts`) only for Android
+phone-image workflows on a configured Linux KVM host. Cuttlefish supports ADB
+command, terminal, project-copy, and artifact-transfer workflows; it does not
+provide OCI environments or snapshots.
+Check declared features with `asbx backend list --json`; use
+`asbx setup --check --no-harness` to verify that the configured backend is
+actually installed and ready.
 
 For a paused, symbol-aware machine debug session:
 
@@ -60,7 +68,8 @@ host as a fallback. Diagnose the sandbox or ask the user how to proceed.
   genuinely requires unrestricted access.
 - Pass only specific values with `--env-var KEY=VALUE`. Host environment
   variables and credentials are not inherited.
-- Write reports or build outputs that must leave the VM below `/out`.
+- Write reports or build outputs that must leave the VM below `/out` on
+  Microsandbox/QEMU, or `/data/local/tmp/asbx/out` on Cuttlefish.
 - Use `--user root` when package or OS installation requires guest root.
 
 ## One-shot
@@ -93,6 +102,24 @@ asbx inspect ID --json
 asbx artifact list ID --json
 asbx close ID
 ```
+
+## Android Cuttlefish
+
+```bash
+asbx doctor --backend cuttlefish
+id="$(asbx open --backend cuttlefish --project . --network off)"
+asbx exec "$id" -- ls /data/local/tmp/asbx/workspace
+asbx exec "$id" -- sh -c \
+  'getprop > /data/local/tmp/asbx/out/properties.txt'
+asbx artifact list "$id"
+asbx close "$id"
+```
+
+Use `--android-artifacts PATH` when the combined host-tools/device-images
+directory is not configured globally. Keep `--network off` unless unrestricted
+Android networking is genuinely required and host policy permits
+`--network all`. Cuttlefish does not support filtered network modes, project
+mounts, port publication, or `--security restricted`.
 
 Read [references/cli.md](references/cli.md) for command forms,
 [references/environments.md](references/environments.md) when auto detection is

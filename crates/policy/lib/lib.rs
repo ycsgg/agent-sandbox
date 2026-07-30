@@ -4,7 +4,7 @@
 
 use std::{
     collections::HashSet,
-    env, fs,
+    env, fmt, fs,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -15,6 +15,7 @@ use agent_sandbox_runtime::{
 };
 use ipnet::IpNet;
 use serde::Deserialize;
+use url::Url;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -88,6 +89,10 @@ pub struct HostConfig {
     pub runtime: RuntimeConfig,
     /// QEMU backend process and guest-transport settings.
     pub qemu: QemuConfig,
+    /// Android Cuttlefish backend settings.
+    pub cuttlefish: CuttlefishConfig,
+    /// Host HTTP proxy settings used by registry and other wrapper clients.
+    pub proxy: ProxyConfig,
     /// Authorized workspace roots.
     pub workspace: WorkspaceConfig,
     /// Network policy gates.
@@ -134,6 +139,45 @@ pub struct QemuConfig {
     pub boot_timeout: String,
     /// Graceful ACPI shutdown deadline.
     pub shutdown_timeout: String,
+}
+
+/// Android Cuttlefish backend settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CuttlefishConfig {
+    /// Combined Cuttlefish host-tools and Android device-images directory.
+    pub artifacts: Option<PathBuf>,
+    /// Device launch and ADB readiness deadline.
+    pub boot_timeout: String,
+    /// Device shutdown deadline.
+    pub shutdown_timeout: String,
+}
+
+/// Host HTTP proxy settings.
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProxyConfig {
+    /// Inherit standard proxy variables from the invoking process.
+    pub inherit_env: bool,
+    /// Explicit proxy for plain HTTP requests.
+    pub http: Option<String>,
+    /// Explicit proxy for HTTPS requests.
+    pub https: Option<String>,
+    /// Explicit proxy for both HTTP and HTTPS when a scheme-specific value is absent.
+    pub all: Option<String>,
+    /// Hosts that bypass the proxy, joined into `NO_PROXY`.
+    pub no_proxy: Vec<String>,
+    /// Forward the resolved proxy variables into guest commands.
+    pub inject_guest: bool,
+}
+
+/// Resolved standard proxy variables.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ProxyEnvironment {
+    http: Option<String>,
+    https: Option<String>,
+    all: Option<String>,
+    no_proxy: Option<String>,
 }
 
 /// Workspace boundary settings.
@@ -336,6 +380,43 @@ impl Default for QemuConfig {
     }
 }
 
+impl Default for CuttlefishConfig {
+    fn default() -> Self {
+        Self {
+            artifacts: None,
+            boot_timeout: "5m".into(),
+            shutdown_timeout: "30s".into(),
+        }
+    }
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            inherit_env: true,
+            http: None,
+            https: None,
+            all: None,
+            no_proxy: Vec::new(),
+            inject_guest: false,
+        }
+    }
+}
+
+impl fmt::Debug for ProxyConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProxyConfig")
+            .field("inherit_env", &self.inherit_env)
+            .field("http", &self.http.as_ref().map(|_| "<redacted>"))
+            .field("https", &self.https.as_ref().map(|_| "<redacted>"))
+            .field("all", &self.all.as_ref().map(|_| "<redacted>"))
+            .field("no_proxy", &self.no_proxy)
+            .field("inject_guest", &self.inject_guest)
+            .finish()
+    }
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
@@ -407,7 +488,7 @@ impl HostConfig {
     /// Load configuration from `ASBX_CONFIG` or the platform config directory.
     ///
     /// A missing file yields secure defaults. The host process environment is
-    /// used only for wrapper configuration and is never forwarded to a guest.
+    /// not forwarded to a guest unless `proxy.inject_guest` is explicitly set.
     pub fn load() -> Result<Self> {
         let path = env::var_os("ASBX_CONFIG").map(PathBuf::from).or_else(|| {
             dirs::home_dir().map(|home| home.join(".agent-sandbox").join("config.toml"))
@@ -425,10 +506,12 @@ impl HostConfig {
             path: path.to_path_buf(),
             source,
         })?;
-        toml::from_str(&text).map_err(|source| PolicyError::ParseConfig {
+        let config: Self = toml::from_str(&text).map_err(|source| PolicyError::ParseConfig {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+        config.proxy.validate()?;
+        Ok(config)
     }
 
     /// Validate a request and calculate all effective values.
@@ -439,7 +522,7 @@ impl HostConfig {
     ) -> Result<EffectiveSpec> {
         if !matches!(
             self.runtime.backend.as_str(),
-            BackendId::MICROSANDBOX | BackendId::QEMU
+            BackendId::MICROSANDBOX | BackendId::QEMU | BackendId::CUTTLEFISH
         ) {
             return Err(PolicyError::Forbidden(format!(
                 "unsupported runtime backend {:?}",
@@ -448,7 +531,7 @@ impl HostConfig {
         }
         if !matches!(
             requested.backend.as_str(),
-            BackendId::MICROSANDBOX | BackendId::QEMU
+            BackendId::MICROSANDBOX | BackendId::QEMU | BackendId::CUTTLEFISH
         ) {
             return Err(PolicyError::Forbidden(format!(
                 "unsupported runtime backend {:?}",
@@ -464,6 +547,24 @@ impl HostConfig {
             (BackendId::QEMU, RootSource::Image(_) | RootSource::Snapshot(_)) => {
                 return Err(PolicyError::Forbidden(
                     "the qemu backend requires a machine boot source".into(),
+                ));
+            }
+            (BackendId::QEMU, RootSource::Android(_)) => {
+                return Err(PolicyError::Forbidden(
+                    "Android artifacts require the cuttlefish backend".into(),
+                ));
+            }
+            (
+                BackendId::CUTTLEFISH,
+                RootSource::Image(_) | RootSource::Snapshot(_) | RootSource::Machine(_),
+            ) => {
+                return Err(PolicyError::Forbidden(
+                    "the cuttlefish backend requires Android artifacts".into(),
+                ));
+            }
+            (BackendId::MICROSANDBOX, RootSource::Android(_)) => {
+                return Err(PolicyError::Forbidden(
+                    "Android artifacts require the cuttlefish backend".into(),
                 ));
             }
             _ => {}
@@ -523,7 +624,38 @@ impl HostConfig {
                 "network mode 'all' is disabled by host configuration".into(),
             ));
         }
+        if requested.backend.as_str() == BackendId::CUTTLEFISH
+            && !matches!(network, NetworkMode::Off | NetworkMode::All)
+        {
+            return Err(PolicyError::Forbidden(
+                "the cuttlefish backend supports network modes 'off' and host-gated 'all' only"
+                    .into(),
+            ));
+        }
         let network_rules = self.validate_network_rules(network, requested.network_rules)?;
+
+        if requested.backend.as_str() == BackendId::CUTTLEFISH
+            && !matches!(
+                requested.project_mode,
+                ProjectMode::None | ProjectMode::Copy
+            )
+        {
+            return Err(PolicyError::Forbidden(
+                "the cuttlefish backend supports project modes 'none' and 'copy' only".into(),
+            ));
+        }
+        if requested.backend.as_str() == BackendId::CUTTLEFISH && !requested.ports.is_empty() {
+            return Err(PolicyError::Forbidden(
+                "the cuttlefish backend does not yet support guest port publication".into(),
+            ));
+        }
+        if requested.backend.as_str() == BackendId::CUTTLEFISH
+            && requested.security != SecurityMode::Default
+        {
+            return Err(PolicyError::Forbidden(
+                "the cuttlefish backend does not implement the restricted security profile".into(),
+            ));
+        }
 
         let rw_mount_quota_mib = match requested.project_mode {
             ProjectMode::None | ProjectMode::Copy | ProjectMode::MountReadOnly => None,
@@ -557,6 +689,14 @@ impl HostConfig {
         }
 
         validate_environment(&requested.env)?;
+        let mut environment = requested.env;
+        if self.proxy.inject_guest {
+            let proxy = self.proxy.environment()?;
+            inject_environment(&mut environment, "HTTP_PROXY", proxy.http());
+            inject_environment(&mut environment, "HTTPS_PROXY", proxy.https());
+            inject_environment(&mut environment, "ALL_PROXY", proxy.all());
+            inject_environment(&mut environment, "NO_PROXY", proxy.no_proxy());
+        }
 
         let memory_tail = parse_bytes(&self.output.memory_tail, "memory_tail")?;
         let memory_tail_bytes =
@@ -582,7 +722,7 @@ impl HostConfig {
             timeout: requested.timeout,
             ttl,
             max_ttl,
-            env: requested.env,
+            env: environment,
             ports: requested.ports,
             memory_tail_bytes,
             max_artifact_bytes: parse_bytes(&self.output.max_artifact_total, "max_artifact_total")?,
@@ -659,9 +799,134 @@ impl HostConfig {
     }
 }
 
+impl ProxyConfig {
+    /// Resolve explicit settings over optional process-environment values.
+    pub fn environment(&self) -> Result<ProxyEnvironment> {
+        self.environment_with(|upper, lower| env::var(upper).ok().or_else(|| env::var(lower).ok()))
+    }
+
+    /// Whether applying this configuration requires a clean child process.
+    pub fn requires_reexec(&self) -> bool {
+        !self.inherit_env
+            || self.http.is_some()
+            || self.https.is_some()
+            || self.all.is_some()
+            || !self.no_proxy.is_empty()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Some(value) = self.http.as_deref() {
+            validate_proxy_url("proxy.http", value)?;
+        }
+        if let Some(value) = self.https.as_deref() {
+            validate_proxy_url("proxy.https", value)?;
+        }
+        if let Some(value) = self.all.as_deref() {
+            validate_proxy_url("proxy.all", value)?;
+        }
+        for value in &self.no_proxy {
+            let valid = !value.is_empty()
+                && value.trim() == value
+                && !value.contains(',')
+                && !value.chars().any(char::is_control);
+            if !valid {
+                return Err(PolicyError::InvalidValue {
+                    field: "proxy.no_proxy",
+                    value: value.clone(),
+                    reason: "entries must be non-empty, comma-free values without surrounding whitespace"
+                        .into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn environment_with(
+        &self,
+        read: impl Fn(&str, &str) -> Option<String>,
+    ) -> Result<ProxyEnvironment> {
+        self.validate()?;
+        let inherited = |upper, lower| self.inherit_env.then(|| read(upper, lower)).flatten();
+        Ok(ProxyEnvironment {
+            http: self
+                .http
+                .clone()
+                .or_else(|| inherited("HTTP_PROXY", "http_proxy")),
+            https: self
+                .https
+                .clone()
+                .or_else(|| inherited("HTTPS_PROXY", "https_proxy")),
+            all: self
+                .all
+                .clone()
+                .or_else(|| inherited("ALL_PROXY", "all_proxy")),
+            no_proxy: if self.no_proxy.is_empty() {
+                inherited("NO_PROXY", "no_proxy")
+            } else {
+                Some(self.no_proxy.join(","))
+            },
+        })
+    }
+}
+
+impl ProxyEnvironment {
+    /// Effective `HTTP_PROXY`.
+    pub fn http(&self) -> Option<&str> {
+        self.http.as_deref()
+    }
+
+    /// Effective `HTTPS_PROXY`.
+    pub fn https(&self) -> Option<&str> {
+        self.https.as_deref()
+    }
+
+    /// Effective `ALL_PROXY`.
+    pub fn all(&self) -> Option<&str> {
+        self.all.as_deref()
+    }
+
+    /// Effective `NO_PROXY`.
+    pub fn no_proxy(&self) -> Option<&str> {
+        self.no_proxy.as_deref()
+    }
+
+    /// Whether no HTTP proxy is active.
+    pub fn is_direct(&self) -> bool {
+        self.http.is_none() && self.https.is_none() && self.all.is_none()
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Functions
 //--------------------------------------------------------------------------------------------------
+
+fn validate_proxy_url(field: &'static str, value: &str) -> Result<()> {
+    let valid = Url::parse(value).ok().is_some_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host().is_some()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none()
+    });
+    if !valid {
+        return Err(PolicyError::InvalidValue {
+            field,
+            value: "<redacted>".into(),
+            reason: "expected an absolute http:// or https:// proxy URL with a host".into(),
+        });
+    }
+    Ok(())
+}
+
+fn inject_environment(environment: &mut Vec<(String, String)>, key: &str, value: Option<&str>) {
+    if let Some(value) = value
+        && !environment
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(key))
+    {
+        environment.push((key.into(), value.into()));
+    }
+}
 
 /// Parse a duration using `ms`, `s`, `m`, `h`, or `d`.
 pub fn parse_duration(value: &str) -> Result<Duration> {
@@ -913,7 +1178,7 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use agent_sandbox_runtime::{MachineBootSpec, RootSource};
+    use agent_sandbox_runtime::{AndroidBootSpec, MachineBootSpec, RootSource};
     use tempfile::tempdir;
 
     use super::*;
@@ -1029,6 +1294,129 @@ mod tests {
             .enforce(requested, root.path())
             .unwrap();
         assert_eq!(effective.backend, BackendId::qemu());
+    }
+
+    #[test]
+    fn cuttlefish_accepts_android_artifacts_with_offline_copy_mode() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut requested = request(project);
+        requested.backend = BackendId::cuttlefish();
+        requested.root = RootSource::Android(Box::new(AndroidBootSpec {
+            artifacts: PathBuf::from("/opt/android/cuttlefish"),
+        }));
+        requested.network = Some(NetworkMode::Off);
+
+        let effective = HostConfig::default()
+            .enforce(requested, root.path())
+            .unwrap();
+        assert_eq!(effective.backend, BackendId::cuttlefish());
+        assert_eq!(effective.network, NetworkMode::Off);
+        assert_eq!(effective.project_mode, ProjectMode::Copy);
+    }
+
+    #[test]
+    fn cuttlefish_rejects_filtered_network_and_host_mounts() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut requested = request(project);
+        requested.backend = BackendId::cuttlefish();
+        requested.root = RootSource::Android(Box::new(AndroidBootSpec {
+            artifacts: PathBuf::from("/opt/android/cuttlefish"),
+        }));
+        requested.network = Some(NetworkMode::Public);
+        assert!(matches!(
+            HostConfig::default().enforce(requested.clone(), root.path()),
+            Err(PolicyError::Forbidden(_))
+        ));
+
+        requested.network = Some(NetworkMode::Off);
+        requested.project_mode = ProjectMode::MountReadOnly;
+        assert!(matches!(
+            HostConfig::default().enforce(requested, root.path()),
+            Err(PolicyError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn explicit_proxy_settings_override_inherited_values() {
+        let proxy = ProxyConfig {
+            inherit_env: true,
+            http: Some("http://127.0.0.1:7890".into()),
+            https: None,
+            all: None,
+            no_proxy: vec!["localhost".into(), "127.0.0.1".into()],
+            inject_guest: false,
+        };
+        let environment = proxy
+            .environment_with(|upper, _| Some(format!("http://inherited-{upper}:8080")))
+            .unwrap();
+
+        assert_eq!(environment.http(), Some("http://127.0.0.1:7890"));
+        assert_eq!(
+            environment.https(),
+            Some("http://inherited-HTTPS_PROXY:8080")
+        );
+        assert_eq!(environment.all(), Some("http://inherited-ALL_PROXY:8080"));
+        assert_eq!(environment.no_proxy(), Some("localhost,127.0.0.1"));
+    }
+
+    #[test]
+    fn invalid_proxy_urls_are_rejected_without_exposing_credentials() {
+        let proxy = ProxyConfig {
+            http: Some("socks5://secret:token@127.0.0.1:7891".into()),
+            ..ProxyConfig::default()
+        };
+        let error = match proxy.environment() {
+            Ok(_) => panic!("SOCKS proxy unexpectedly passed validation"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("proxy.http"));
+        assert!(!error.contains("secret"));
+        assert!(!error.contains("token"));
+    }
+
+    #[test]
+    fn guest_proxy_injection_preserves_explicit_guest_values() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let mut requested = request(project);
+        requested
+            .env
+            .push(("http_proxy".into(), "http://guest-explicit:8080".into()));
+
+        let config = HostConfig {
+            proxy: ProxyConfig {
+                inherit_env: false,
+                http: Some("http://host-proxy:7890".into()),
+                https: Some("http://host-proxy:7890".into()),
+                no_proxy: vec!["localhost".into()],
+                inject_guest: true,
+                ..ProxyConfig::default()
+            },
+            ..HostConfig::default()
+        };
+
+        let effective = config.enforce(requested, root.path()).unwrap();
+        assert!(
+            effective
+                .env
+                .contains(&("http_proxy".into(), "http://guest-explicit:8080".into()))
+        );
+        assert!(!effective.env.iter().any(|(key, _)| key == "HTTP_PROXY"));
+        assert!(
+            effective
+                .env
+                .contains(&("HTTPS_PROXY".into(), "http://host-proxy:7890".into()))
+        );
+        assert!(
+            effective
+                .env
+                .contains(&("NO_PROXY".into(), "localhost".into()))
+        );
     }
 
     fn request(project: PathBuf) -> RequestedSpec {

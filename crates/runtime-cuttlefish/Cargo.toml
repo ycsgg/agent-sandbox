@@ -1,5 +1,5 @@
 [package]
-name = "agent-sandbox-policy"
+name = "agent-sandbox-runtime-cuttlefish"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,12 +10,12 @@ path = "lib/lib.rs"
 
 [dependencies]
 agent-sandbox-runtime.workspace = true
-dirs.workspace = true
-ipnet.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
 serde.workspace = true
-thiserror.workspace = true
-toml.workspace = true
-url.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

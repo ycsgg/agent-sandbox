@@ -3,8 +3,9 @@
 `asbx` runs isolated workloads through pluggable local VM backends.
 Microsandbox handles OCI-based project commands; QEMU handles bootable disks,
 direct kernel boot, multiple guest architectures, serial logs, QMP, and an
-optional loopback GDB stub. Project code is copied into the guest by default,
-host environment variables are not inherited, public networking excludes
+optional loopback GDB stub; Cuttlefish handles Android phone images on Linux
+KVM hosts through ADB. Project code is copied into the guest by default, host
+environment variables are not inherited, public networking excludes
 host/private/link-local ranges, and one-shot VMs are removed after execution.
 Guest output is streamed through bounded queues; retained JSON tails and
 artifacts are capped by host configuration. Cross-process SQLite reservations
@@ -34,24 +35,71 @@ but it is intentionally ignored by Git.
 ```bash
 cargo build --release -p agent-sandbox-cli
 cargo install --path crates/cli
+asbx setup
 ```
 
 Rust 1.94 or newer is required. Microsandbox v0.6.7 uses KVM on Linux,
 Hypervisor.framework on Apple Silicon macOS, and Windows Hypervisor Platform
 on Windows. The QEMU backend selects KVM, HVF, or WHPX for same-architecture
 guests and falls back to TCG for cross-architecture guests. QEMU is optional
-unless that backend is selected.
+unless that backend is selected. Cuttlefish is optional and requires Linux,
+read/write access to KVM and vhost-vsock, the Cuttlefish host packages, and
+matching host-tool/device-image artifacts.
 
-On Apple Silicon, use the Microsandbox setup checks before the first VM:
+This repository does not yet publish prebuilt `asbx` binaries or a package
+manager formula, so end users currently install from a checkout. Building
+downloads the pinned Microsandbox guest agent into Cargo's build output, but
+does not provision `msb` or `libkrunfw` into the user's home. `asbx setup` is
+the target-machine installation, verification, and repair entry point.
+
+## Setup
+
+Run the setup wizard after installation and whenever the selected backend or
+agent CLI changes:
 
 ```bash
-cargo run -p agent-sandbox-cli -- doctor
-cargo run -p agent-sandbox-cli -- doctor --backend qemu
+asbx setup
+asbx setup --check
+asbx setup --check --json
 ```
+
+The wizard diagnoses Microsandbox, QEMU, configured Cuttlefish artifacts, and
+local Codex, Claude Code, Cursor, Gemini CLI, and OpenCode installations. It
+prints one plan and asks for confirmation before downloading a runtime,
+invoking a system package manager, creating the host config, or installing the
+Agent Skill.
+When Microsandbox runtime files are missing, setup resolves GitHub's latest
+stable release at runtime and verifies the selected platform bundle against
+the release asset's published SHA-256. It never silently changes backends or
+falls back to host execution.
+
+Codex, Cursor, Gemini CLI, and OpenCode share the open Agent Skills location
+`~/.agents/skills/agent-sandbox`. Claude Code uses
+`~/.claude/skills/agent-sandbox`. Re-running setup is idempotent; an existing
+unmanaged skill is not changed without `--force`.
+
+Explicit reconfiguration is available for scripts and less common layouts:
+
+```bash
+asbx setup --default-backend microsandbox
+asbx setup --install-backend qemu
+asbx setup --install-backend cuttlefish
+asbx setup --harness codex,claude-code
+asbx setup --no-harness
+asbx setup --yes
+```
+
+`--yes` applies the displayed deterministic plan without prompting and is
+required for non-interactive mutation. `--check` never writes. QEMU is
+installed only when selected, using a detected system package manager after
+confirmation. Cuttlefish setup is verification-only: install its Linux host
+packages separately, extract a matching `cvd-host_package.tar.gz` and Android
+device-image archive into one directory, and set `cuttlefish.artifacts`.
 
 ## Usage
 
 ```bash
+asbx setup --check --no-harness
 asbx env detect --project . --json
 asbx run --project . --env auto -- cargo test --workspace
 asbx run --project . --project-mode mount-ro --network dependencies -- cargo fetch
@@ -63,6 +111,19 @@ asbx run --project . --env audit-full -- ./scripts/verify.sh
 id="$(asbx open --project . --env node@22)"
 asbx exec "$id" -- npm ci
 asbx exec "$id" -- npm test
+asbx close "$id"
+
+# Android Cuttlefish; --android-artifacts also implies --backend cuttlefish.
+asbx doctor --backend cuttlefish
+asbx run --android-artifacts /opt/android/cuttlefish \
+  --project-mode none --network off -- getprop ro.build.version.release
+
+id="$(asbx open --backend cuttlefish --project . --network off)"
+asbx exec "$id" -- ls /data/local/tmp/asbx/workspace
+asbx exec "$id" -- sh -c \
+  'getprop > /data/local/tmp/asbx/out/properties.txt'
+asbx artifact get "$id" /data/local/tmp/asbx/out/properties.txt \
+  --to ./properties.txt
 asbx close "$id"
 
 asbx cache status --json
@@ -83,6 +144,32 @@ asbx debug "$id" --symbols ./vmlinux
 asbx close "$id"
 ```
 
+## Proxy and registry access
+
+`asbx` inherits `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and `NO_PROXY` for
+host-side OCI image pulls. Persistent settings can be placed in
+`~/.agent-sandbox/config.toml` (or the file passed with `--config`):
+
+```toml
+[proxy]
+inherit_env = false
+http = "http://127.0.0.1:7890"
+https = "http://127.0.0.1:7890"
+# `all` is also supported when one proxy handles both schemes.
+no_proxy = ["localhost", "127.0.0.1", "::1"]
+inject_guest = false
+```
+
+File-backed settings are applied by a one-time self re-exec before registry
+clients are constructed; no proxy helper or resident `asbx` daemon is started.
+File-backed proxy URLs must use HTTP(S). Docker Hub shorthand such as
+`alpine:3.20`, `library/alpine`, and `docker.io/library/alpine` is normalized
+to `registry-1.docker.io`, avoiding the legacy `index.docker.io` endpoint.
+
+`inject_guest` is intentionally off by default. Enable it only when the proxy
+address and network policy are reachable from inside the VM; `127.0.0.1` in a
+guest is not the host and therefore is not a usable guest proxy endpoint.
+
 QEMU machine mode defaults to no workspace and offline networking. A writable
 root disk uses QEMU temporary snapshot mode, so the caller-owned base image is
 not modified. Configure `qemu.ssh_user` (and usually `qemu.ssh_key`) to enable
@@ -91,6 +178,15 @@ Filtered `public`, `dependencies`, and `rules` networking remains a
 Microsandbox capability; QEMU currently accepts only `off` and host-gated
 `all`. QEMU lease expiry is enforced on the next `asbx` invocation; unlike
 Microsandbox, the QEMU adapter does not install an always-running TTL helper.
+
+Cuttlefish accepts project modes `none` and `copy`. Its workspace is
+`/data/local/tmp/asbx/workspace`, its downloadable artifact directory is
+`/data/local/tmp/asbx/out`, and its default shell is `/system/bin/sh`.
+Networking defaults to `off` by launching recent Cuttlefish tools without TAP
+devices. Host-gated `all` is also available; filtered modes, host mounts,
+published guest ports, and the wrapper restricted profile are rejected until
+they can be enforced honestly. Like QEMU, Cuttlefish lease expiry is reclaimed
+on the next `asbx` invocation rather than by a resident helper.
 
 `asbx debug` validates the session, loopback endpoint, symbol architecture,
 and debugger executable before attaching. It automatically selects LLDB on

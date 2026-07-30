@@ -12,7 +12,9 @@ use tracing_subscriber::EnvFilter;
 
 mod bootstrap;
 mod commands;
+mod proxy;
 mod request;
+mod setup;
 
 use crate::debugger;
 
@@ -41,6 +43,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Detect, install, and reconfigure local backends and agent integrations.
+    Setup(SetupArgs),
     /// Diagnose runtime and host prerequisites.
     Doctor {
         /// Backend to diagnose; defaults to runtime.backend.
@@ -103,7 +107,7 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List or download `/out` artifacts.
+    /// List or download backend-managed guest artifacts.
     Artifact {
         #[command(subcommand)]
         command: ArtifactCommand,
@@ -118,6 +122,39 @@ enum Command {
         #[command(subcommand)]
         command: CacheCommand,
     },
+}
+
+#[derive(Debug, Args)]
+struct SetupArgs {
+    /// Inspect setup state without changing the host.
+    #[arg(long, conflicts_with = "yes")]
+    check: bool,
+    /// Set the backend used when --backend is omitted.
+    #[arg(long, value_enum)]
+    default_backend: Option<SetupBackendArg>,
+    /// Prepare an additional backend without making it the default.
+    #[arg(long = "install-backend", value_enum, value_delimiter = ',')]
+    install_backends: Vec<SetupBackendArg>,
+    /// Install the Agent Skill for a harness; repeat or comma-separate values.
+    #[arg(
+        long = "harness",
+        value_enum,
+        value_delimiter = ',',
+        conflicts_with = "no_harness"
+    )]
+    harnesses: Vec<SetupHarnessArg>,
+    /// Do not configure any agent harness.
+    #[arg(long)]
+    no_harness: bool,
+    /// Apply the displayed plan without an interactive confirmation.
+    #[arg(short = 'y', long)]
+    yes: bool,
+    /// Permit updating an existing skill not previously managed by asbx.
+    #[arg(long)]
+    force: bool,
+    /// Emit machine-readable setup state and plan (requires --check).
+    #[arg(long, requires = "check")]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -143,10 +180,10 @@ struct OpenArgs {
 
 #[derive(Debug, Args)]
 struct CommonSandboxArgs {
-    /// Runtime backend. Machine boot options imply qemu.
+    /// Runtime backend. Machine boot options imply qemu; Android artifacts imply cuttlefish.
     #[arg(long)]
     backend: Option<BackendId>,
-    /// Project directory to copy or mount at `/workspace`.
+    /// Project directory to copy or mount at the backend workspace path.
     #[arg(long, default_value = ".")]
     project: PathBuf,
     /// Project exposure mode. Writable mounts require explicit host policy.
@@ -161,6 +198,9 @@ struct CommonSandboxArgs {
     /// Use a Microsandbox snapshot. Takes precedence over --env.
     #[arg(long)]
     snapshot: Option<String>,
+    /// Combined Cuttlefish host-tools and Android device-images directory.
+    #[arg(long)]
+    android_artifacts: Option<PathBuf>,
     /// Bootable raw or qcow2 disk for the QEMU backend.
     #[arg(long)]
     root_disk: Option<PathBuf>,
@@ -272,9 +312,9 @@ struct CommonSandboxArgs {
 struct SessionExecArgs {
     /// Sandbox session ID.
     id: String,
-    /// Guest working directory.
-    #[arg(long, default_value = "/workspace")]
-    cwd: String,
+    /// Guest working directory. Defaults to the directory recorded by `open`.
+    #[arg(long)]
+    cwd: Option<String>,
     /// Guest user override.
     #[arg(long)]
     user: Option<String>,
@@ -296,20 +336,20 @@ struct SessionExecArgs {
 struct ShellArgs {
     /// Sandbox session ID.
     id: String,
-    /// Guest working directory.
-    #[arg(long, default_value = "/workspace")]
-    cwd: String,
+    /// Guest working directory. Defaults to the directory recorded by `open`.
+    #[arg(long)]
+    cwd: Option<String>,
     /// Guest user override.
     #[arg(long)]
     user: Option<String>,
-    /// Shell executable.
-    #[arg(long, default_value = "/bin/sh")]
-    shell: String,
+    /// Shell executable. Defaults to the backend's declared guest shell.
+    #[arg(long)]
+    shell: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
 enum ArtifactCommand {
-    /// List regular files below `/out`.
+    /// List regular files below the backend artifact directory.
     List {
         /// Sandbox session ID.
         id: String,
@@ -317,7 +357,7 @@ enum ArtifactCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Download one regular `/out` file.
+    /// Download one regular file from the backend artifact directory.
     Get {
         /// Sandbox session ID.
         id: String,
@@ -442,6 +482,24 @@ enum BackendCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum SetupBackendArg {
+    Microsandbox,
+    Qemu,
+    Cuttlefish,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum SetupHarnessArg {
+    All,
+    Codex,
+    ClaudeCode,
+    Cursor,
+    Gemini,
+    #[value(name = "opencode")]
+    OpenCode,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum NetworkArg {
     Off,
@@ -477,6 +535,14 @@ enum MetadataOutput {
 #[tokio::main]
 pub(crate) async fn entry() -> ExitCode {
     let cli = Cli::parse();
+    match proxy::reexec_if_needed(&cli) {
+        Ok(Some(code)) => return exit_code(code),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("asbx: {error:#}");
+            return ExitCode::FAILURE;
+        }
+    }
     init_logging(cli.verbose);
     match commands::run(cli).await {
         Ok(code) => exit_code(code),
@@ -578,5 +644,81 @@ mod tests {
         };
         assert_eq!(backend.as_str(), "future-backend");
         assert!(json);
+    }
+
+    #[test]
+    fn session_commands_leave_cwd_unset_for_session_resolution() {
+        let exec = Cli::try_parse_from(["asbx", "exec", "sbx_test", "--", "/bin/true"]).unwrap();
+        let Command::Exec(arguments) = exec.command else {
+            panic!("exec command was not parsed");
+        };
+        assert_eq!(arguments.cwd, None);
+
+        let shell = Cli::try_parse_from(["asbx", "shell", "sbx_test"]).unwrap();
+        let Command::Shell(arguments) = shell.command else {
+            panic!("shell command was not parsed");
+        };
+        assert_eq!(arguments.cwd, None);
+        assert_eq!(arguments.shell, None);
+    }
+
+    #[test]
+    fn android_artifacts_select_cuttlefish_with_offline_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let cli = Cli::try_parse_from([
+            "asbx",
+            "run",
+            "--android-artifacts",
+            directory.path().to_str().unwrap(),
+            "--",
+            "id",
+        ])
+        .unwrap();
+        let Command::Run(arguments) = cli.command else {
+            panic!("run command was not parsed");
+        };
+        let options = request::sandbox_options(arguments.sandbox).unwrap();
+        assert_eq!(options.backend, Some(BackendId::cuttlefish()));
+        assert_eq!(
+            options.android_artifacts,
+            Some(directory.path().canonicalize().unwrap())
+        );
+        assert_eq!(
+            options.network,
+            Some(agent_sandbox_runtime::NetworkMode::Off)
+        );
+        assert_eq!(
+            options.project_mode,
+            agent_sandbox_runtime::ProjectMode::Copy
+        );
+    }
+
+    #[test]
+    fn setup_accepts_repeatable_backends_and_harnesses() {
+        let cli = Cli::try_parse_from([
+            "asbx",
+            "setup",
+            "--default-backend",
+            "microsandbox",
+            "--install-backend",
+            "qemu",
+            "--harness",
+            "codex,claude-code",
+            "--yes",
+        ])
+        .unwrap();
+        let Command::Setup(arguments) = cli.command else {
+            panic!("setup command was not parsed");
+        };
+        assert_eq!(
+            arguments.default_backend,
+            Some(SetupBackendArg::Microsandbox)
+        );
+        assert_eq!(arguments.install_backends, [SetupBackendArg::Qemu]);
+        assert_eq!(
+            arguments.harnesses,
+            [SetupHarnessArg::Codex, SetupHarnessArg::ClaudeCode]
+        );
+        assert!(arguments.yes);
     }
 }

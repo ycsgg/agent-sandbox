@@ -83,6 +83,8 @@ pub struct SessionRecord {
     pub project: PathBuf,
     /// Resolved root source description.
     pub root: String,
+    /// Default guest working directory for commands in this session.
+    pub default_cwd: String,
     /// Creation time.
     pub created_at: DateTime<Utc>,
     /// Wrapper lease expiration.
@@ -174,7 +176,8 @@ impl StateStore {
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
                 maximum_expires_at INTEGER NOT NULL,
-                ports_json TEXT NOT NULL
+                ports_json TEXT NOT NULL,
+                default_cwd TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_expires_at
                 ON sessions(expires_at);
@@ -419,8 +422,9 @@ impl StateStore {
     pub fn insert(&self, record: &SessionRecord) -> Result<()> {
         self.connection()?.execute(
             "INSERT INTO sessions (
-                id, backend, project, root, created_at, expires_at, maximum_expires_at, ports_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                id, backend, project, root, created_at, expires_at, maximum_expires_at, ports_json,
+                default_cwd
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 record.id,
                 record.backend.as_str(),
@@ -430,6 +434,7 @@ impl StateStore {
                 record.expires_at.timestamp(),
                 record.maximum_expires_at.timestamp(),
                 serde_json::to_string(&record.ports)?,
+                record.default_cwd,
             ],
         )?;
         Ok(())
@@ -439,7 +444,8 @@ impl StateStore {
     pub fn get(&self, id: &str) -> Result<SessionRecord> {
         self.connection()?
             .query_row(
-                "SELECT id, backend, project, root, created_at, expires_at, maximum_expires_at, ports_json
+                "SELECT id, backend, project, root, created_at, expires_at, maximum_expires_at,
+                        ports_json, default_cwd
                  FROM sessions WHERE id = ?1",
                 [id],
                 decode_record,
@@ -452,7 +458,8 @@ impl StateStore {
     pub fn list(&self) -> Result<Vec<SessionRecord>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, backend, project, root, created_at, expires_at, maximum_expires_at, ports_json
+            "SELECT id, backend, project, root, created_at, expires_at, maximum_expires_at,
+                    ports_json, default_cwd
              FROM sessions ORDER BY created_at ASC",
         )?;
         let records = statement
@@ -465,7 +472,8 @@ impl StateStore {
     pub fn expired(&self, now: DateTime<Utc>) -> Result<Vec<SessionRecord>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, backend, project, root, created_at, expires_at, maximum_expires_at, ports_json
+            "SELECT id, backend, project, root, created_at, expires_at, maximum_expires_at,
+                    ports_json, default_cwd
              FROM sessions WHERE expires_at <= ?1 ORDER BY expires_at ASC",
         )?;
         let records = statement
@@ -620,6 +628,7 @@ fn decode_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         backend,
         project: PathBuf::from(row.get::<_, String>(2)?),
         root: row.get(3)?,
+        default_cwd: row.get(8)?,
         created_at: parse_time(created_at)?,
         expires_at: parse_time(expires_at)?,
         maximum_expires_at: parse_time(maximum_expires_at)?,
@@ -702,6 +711,7 @@ mod tests {
             backend: BackendId::microsandbox(),
             project: PathBuf::from("/workspace/project"),
             root: "alpine".into(),
+            default_cwd: "/workspace".into(),
             created_at: now,
             expires_at: now + chrono::Duration::minutes(30),
             maximum_expires_at: now + chrono::Duration::hours(8),
@@ -744,6 +754,7 @@ mod tests {
             .touch("sbx_test", Duration::from_secs(3600), Utc::now())
             .unwrap();
         assert!(touched.expires_at > touched.created_at);
+        assert_eq!(touched.default_cwd, "/workspace");
         store.remove("sbx_test").unwrap();
         assert!(matches!(
             store.get("sbx_test"),
@@ -855,7 +866,8 @@ mod tests {
                     created_at INTEGER NOT NULL,
                     expires_at INTEGER NOT NULL,
                     maximum_expires_at INTEGER NOT NULL,
-                    ports_json TEXT NOT NULL
+                    ports_json TEXT NOT NULL,
+                    default_cwd TEXT NOT NULL
                 );",
             )
             .unwrap();
@@ -863,8 +875,9 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO sessions (
-                    id, project, root, created_at, expires_at, maximum_expires_at, ports_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    id, project, root, created_at, expires_at, maximum_expires_at, ports_json,
+                    default_cwd
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     "legacy",
                     "/workspace/project",
@@ -873,6 +886,7 @@ mod tests {
                     (now + chrono::Duration::minutes(30)).timestamp(),
                     (now + chrono::Duration::hours(8)).timestamp(),
                     "[]",
+                    "/workspace",
                 ],
             )
             .unwrap();

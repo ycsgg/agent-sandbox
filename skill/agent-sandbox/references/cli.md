@@ -1,5 +1,24 @@
 # CLI reference
 
+## Host setup and Agent integrations
+
+```bash
+asbx setup
+asbx setup --check [--json]
+asbx setup --default-backend microsandbox|qemu|cuttlefish
+asbx setup --install-backend microsandbox|qemu|cuttlefish
+asbx setup --harness codex,claude-code,cursor,gemini,opencode
+```
+
+Plain `setup` detects installed harnesses, displays backend readiness and a
+deterministic change plan, then asks once before applying it. `--check` is
+read-only. Use `--yes` only after reviewing the plan when stdin is
+non-interactive. Existing unmanaged skills require `--force`.
+
+Codex, Cursor, Gemini CLI, and OpenCode use the shared
+`~/.agents/skills/agent-sandbox` installation. Claude Code uses
+`~/.claude/skills/agent-sandbox`.
+
 ## One-shot execution
 
 ```bash
@@ -11,7 +30,8 @@ Important options:
 - `--project PATH`
 - `--env auto|go@VERSION|rust@VERSION|node@VERSION`
 - `--image OCI_REF` or `--snapshot NAME`
-- `--backend microsandbox|qemu`
+- `--backend microsandbox|qemu|cuttlefish`
+- `--android-artifacts PATH` (implies Cuttlefish)
 - `--cpus N`, `--memory SIZE`, `--disk SIZE`
 - `--user USER`, `--security default|restricted`
 - `--project-mode none|copy|mount-ro|mount-rw`
@@ -81,6 +101,31 @@ Mounts expose only the canonical authorized project. `mount-ro` prevents guest
 writes. `mount-rw` is host-policy gated, quota-limited, and intentionally lets
 guest code change host project files.
 
+## Android Cuttlefish
+
+```bash
+asbx doctor --backend cuttlefish
+asbx run --android-artifacts /opt/android/cuttlefish \
+  --project-mode none --network off -- getprop ro.build.version.release
+
+id="$(asbx open --backend cuttlefish --project . --network off)"
+asbx exec "$id" -- ls /data/local/tmp/asbx/workspace
+asbx shell "$id"
+asbx close "$id"
+```
+
+The configured artifacts directory must combine a matching Cuttlefish host
+package and Android phone image. Cuttlefish is Linux/KVM-only and requires
+vhost-vsock. It accepts `none` or `copy` project mode and `off` or host-gated
+`all` networking. Filtered egress, host mounts, published ports, the restricted
+profile, OCI images, and wrapper snapshots are unavailable.
+
+Android guest paths differ from the POSIX VM backends:
+
+- workspace: `/data/local/tmp/asbx/workspace`
+- artifacts: `/data/local/tmp/asbx/out`
+- default shell: `/system/bin/sh`
+
 ## Persistent sessions
 
 ```bash
@@ -102,10 +147,12 @@ substitution is safe. Port information is printed on stderr.
 asbx ports ID [--json]
 asbx artifact list ID [--json]
 asbx artifact get ID /out/report.json --to ./report.json
+asbx artifact get ANDROID_ID /data/local/tmp/asbx/out/report.json --to ./report.json
 ```
 
-Only regular files below `/out` can be downloaded. The host destination must
-remain inside an authorized workspace root.
+Only regular files below the selected backend's artifact directory can be
+downloaded. The host destination must remain inside an authorized workspace
+root.
 
 ## Environment and diagnostics
 
@@ -116,7 +163,8 @@ asbx env create NAME --base ubuntu:24.04 \
 asbx env list [--json]
 asbx env inspect NAME [--json]
 asbx env remove NAME
-asbx doctor [--backend microsandbox|qemu] [--json]
+asbx setup --check [--json]
+asbx doctor [--backend microsandbox|qemu|cuttlefish] [--json]
 asbx backend list [--json]
 asbx cache status [--json]
 asbx cache prune [--max-size SIZE] [--older-than DURATION] \
@@ -126,3 +174,7 @@ asbx cache prune [--max-size SIZE] [--older-than DURATION] \
 Managed environment cache keys include the resolved base-image manifest
 digest, host architecture, normalized toolchain versions, and provisioning
 manifest version. Cache pruning protects named environments by default.
+
+`backend list` reports adapters and declared capabilities compiled into asbx;
+it does not claim that their external tools are installed. Use `setup --check`
+or the backend-specific `doctor` command for readiness.

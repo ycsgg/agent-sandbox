@@ -7,15 +7,17 @@
 - 根据项目声明识别 Go、Rust、Node.js、TypeScript 等运行环境及版本。
 - 使用预置环境、任意 OCI 镜像或 Microsandbox snapshot。
 - 使用 QEMU 启动磁盘镜像、自定义 kernel/initrd/DTB 和不同 CPU 架构。
+- 使用 Cuttlefish 启动 Android phone image，并通过 ADB 执行命令和传输文件。
 - 创建一次性 sandbox，执行编译、测试、审计和验证命令。
 - 在同一个 sandbox 中进行多轮操作。
 - 启动服务并通过宿主本地端口访问。
 - 取回报告、日志和构建产物。
 - 完成后销毁 sandbox，不留下常驻 VM 或 daemon。
 
-底层通过 backend registry 同时支持 Microsandbox 和 QEMU。Microsandbox
-负责快速 OCI 工作流；QEMU 负责完整系统启动、跨架构、串口、QMP 和 GDB
-stub。上层 core、lease 和状态模型不与任一 backend 强耦合。
+底层通过 backend registry 同时支持 Microsandbox、QEMU 和 Cuttlefish。
+Microsandbox 负责快速 OCI 工作流；QEMU 负责完整系统启动、跨架构、串口、
+QMP 和 GDB stub；Cuttlefish 负责 Linux/KVM 上的 Android phone image 与
+ADB 通道。上层 core、lease 和状态模型不与任一 backend 强耦合。
 
 ## 2. 威胁模型
 
@@ -27,7 +29,7 @@ stub。上层 core、lease 和状态模型不与任一 backend 强耦合。
 - AI Agent 及其决策。
 - Agent Sandbox wrapper。
 - 由我们维护的基础镜像、环境目录和 provisioning 脚本。
-- Microsandbox、libkrun、QEMU、宿主 hypervisor 和宿主内核。
+- Microsandbox、libkrun、QEMU、Cuttlefish、宿主 hypervisor 和宿主内核。
 
 Agent 可以自由选择命令、镜像、网络模式、guest 用户、资源和环境构建方式。wrapper 不需要防止一个主动恶意的 Agent 绕过产品意图。
 
@@ -78,7 +80,8 @@ Agent Sandbox Core
    ▼
 Runtime Registry
    ├── Microsandbox SDK → libkrun → KVM / Hypervisor.framework / WHP
-   └── QEMU → KVM / HVF / WHPX / TCG
+   ├── QEMU → KVM / HVF / WHPX / TCG
+   └── Cuttlefish → crosvm / KVM → Android + ADB
 ```
 
 不引入 MCP server，原因如下：
@@ -95,7 +98,8 @@ Skill 是使用说明和工作流，不承担强制隔离。即使 Agent 没有�
 
 固定 Microsandbox 版本并通过 adapter 使用其 Rust SDK；QEMU 通过独立
 adapter 调用系统安装的 `qemu-system-*`，使用 QMP 管理生命周期，使用可选
-SSH transport 提供命令和文件通道。
+SSH transport 提供命令和文件通道。Cuttlefish adapter 使用匹配的
+host-tool/device-image 目录启动独立 instance，以 ADB 提供命令与文件通道。
 
 只在出现 wrapper 无法解决的 core 问题时维护小型 patch branch，并优先向上游提交：
 
@@ -555,6 +559,7 @@ asbx artifact get sbx_01J... /out/report.json --to ./report.json
 
 ```text
 asbx
+├── setup
 ├── doctor
 ├── run
 ├── open
@@ -583,6 +588,16 @@ asbx
     ├── status
     └── prune
 ```
+
+`asbx setup` 是可重复运行的宿主配置入口。它先检测 backend、虚拟化能力和
+Codex、Claude Code、Cursor、Gemini CLI、OpenCode 等 harness，再展示唯一
+变更计划并等待确认。`--check` 只检测，`--yes` 用于调用方已经审核计划的
+非交互执行；缺少 backend 时不静默切换到语义不同的 backend，更不会回退到
+宿主执行项目代码。
+
+通用 Agent Skills 安装到 `~/.agents/skills/agent-sandbox`，Claude Code
+安装到 `~/.claude/skills/agent-sandbox`。已有非 asbx 管理的同名 Skill
+必须显式 `--force` 才会更新已知文件。
 
 ### 10.2 通用参数
 
@@ -634,6 +649,7 @@ agent-sandbox/
 │   ├── runtime/       # backend trait
 │   ├── runtime-msb/   # Microsandbox adapter
 │   ├── runtime-qemu/  # QEMU/QMP/SSH adapter
+│   ├── runtime-cuttlefish/ # Android Cuttlefish/ADB adapter
 │   ├── transfer/      # project/artifact broker
 │   ├── exec/          # streaming、timeout、output
 │   ├── state/         # SQLite、lease、reaper
@@ -654,6 +670,7 @@ app.rs                  # Clap 参数模型
 app/bootstrap.rs        # 配置、状态和 concrete backend 装配
 app/commands.rs         # 命令分派与用户可见工作流
 app/request.rs          # CLI 参数 → runtime-neutral core request
+app/setup.rs            # backend/harness 检测、确认计划和可重复配置
 debugger.rs             # debugger 发现、计划和启动
 ```
 
@@ -664,6 +681,7 @@ backend 实现一个不断变大的接口：
 trait SandboxRuntime {
     fn backend_id(&self) -> BackendId;
     fn capabilities(&self) -> BackendCapabilities;
+    fn guest_layout(&self) -> GuestLayout;
 
     // 均有默认 None；backend 只暴露真实支持的能力。
     fn command_runtime(&self) -> Option<&dyn CommandRuntime> { None }
@@ -698,6 +716,11 @@ trait CommandRuntime {
 4. 只在 `app/bootstrap.rs` 注册 concrete adapter；core 和已有命令不依赖
    backend 类型。实现 `DebugRuntime` 的 GDB remote backend 可直接复用
    `asbx debug`，无需增加 backend 名称分支或解析私有 metadata。
+
+`GuestLayout` 让 core 不再假定所有 guest 都使用 `/workspace`、`/out` 和
+`/bin/sh`。Cuttlefish 对应的路径分别是
+`/data/local/tmp/asbx/workspace`、`/data/local/tmp/asbx/out` 和
+`/system/bin/sh`。
 
 `--backend` 直接解析开放式 `BackendId`，不维护 CLI backend 枚举；因此新增
 backend 不需要修改 Clap 参数模型。
@@ -754,6 +777,20 @@ max_ttl = "8h"
 boot_timeout = "2m"
 shutdown_timeout = "10s"
 
+[cuttlefish]
+# 同一 Android build 的 host package 与 phone image 解压到同一目录。
+# artifacts = "/opt/android/cuttlefish"
+boot_timeout = "5m"
+shutdown_timeout = "30s"
+
+[proxy]
+inherit_env = true
+# http = "http://127.0.0.1:7890"
+# https = "http://127.0.0.1:7890"
+# all = "http://127.0.0.1:7890"
+no_proxy = []
+inject_guest = false
+
 [workspace]
 roots = [
   "/Users/example/labs",
@@ -784,6 +821,13 @@ max_artifact_total = "2G"
 [cache]
 max_size = "50G"
 ```
+
+宿主侧 OCI 拉取默认读取标准 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 与
+`NO_PROXY`。
+配置文件中的显式代理通过一次性 self re-exec 在 HTTP client 创建前生效，
+不会引入常驻 daemon。Docker Hub 简写统一展开到
+`registry-1.docker.io`。`inject_guest` 默认关闭；宿主的 loopback 代理地址
+不能直接从 guest 内访问。
 
 这里的默认值应保持宽松、可见和可配置，不把特定数字写死在 Skill。
 

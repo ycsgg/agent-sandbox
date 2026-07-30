@@ -17,9 +17,9 @@ use agent_sandbox_environment::{
 };
 use agent_sandbox_policy::{EffectiveSpec, HostConfig, RequestedSpec};
 use agent_sandbox_runtime::{
-    BackendId, CreateSpec, DebugContext, ExecRequest, ExecStream, ImageInfo, MachineBootSpec,
-    NetworkMode, NetworkRule, NetworkRuleAction, NetworkRuleTarget, PortMapping, ProjectMode,
-    RootSource, SandboxInfo, SandboxRuntime, SecurityMode, WorkspaceSpec,
+    AndroidBootSpec, BackendId, CreateSpec, DebugContext, ExecRequest, ExecStream, GuestLayout,
+    ImageInfo, MachineBootSpec, NetworkMode, NetworkRule, NetworkRuleAction, NetworkRuleTarget,
+    PortMapping, ProjectMode, RootSource, SandboxInfo, SandboxRuntime, SecurityMode, WorkspaceSpec,
 };
 use agent_sandbox_state::{
     EnvironmentRecord, ReservationRecord, SessionRecord, StateError, StateStore,
@@ -93,6 +93,8 @@ pub struct SandboxOptions {
     pub backend: Option<BackendId>,
     /// Explicit full-system machine boot inputs.
     pub machine: Option<MachineBootSpec>,
+    /// Combined Android Cuttlefish host-tools and device-images directory.
+    pub android_artifacts: Option<PathBuf>,
     /// Project directory.
     pub project: PathBuf,
     /// Explicit OCI image.
@@ -151,6 +153,8 @@ pub struct OpenedSandbox {
     pub network: NetworkMode,
     /// Published loopback ports.
     pub ports: Vec<PortMapping>,
+    /// Backend-specific guest paths and default shell.
+    pub guest_layout: GuestLayout,
     /// Effective wrapper lease TTL.
     #[serde(skip)]
     pub ttl: Duration,
@@ -459,7 +463,7 @@ impl AgentSandbox {
             effective.max_reserved_memory_mib,
         )?;
         if let Err(error) = self.runtime.create(&spec).await {
-            let _ = self.state.release(&id);
+            self.cleanup_failed_create(&id, &error).await?;
             return Err(error.into());
         }
         if let Err(error) = self.state.activate(&id) {
@@ -880,6 +884,33 @@ impl AgentSandbox {
         Ok(())
     }
 
+    async fn cleanup_failed_create(
+        &self,
+        id: &str,
+        create_error: &agent_sandbox_runtime::RuntimeError,
+    ) -> Result<()> {
+        match self.runtime.inspect(id).await {
+            Err(agent_sandbox_runtime::RuntimeError::NotFound(_)) => {
+                self.state.release(id)?;
+                Ok(())
+            }
+            Ok(_) => self.cleanup(id).await.map_err(|cleanup_error| CoreError::Cleanup {
+                id: id.into(),
+                message: format!(
+                    "runtime creation failed ({create_error}); recovery failed ({cleanup_error}); \
+                     the reservation was retained for reconciliation"
+                ),
+            }),
+            Err(inspect_error) => Err(CoreError::Cleanup {
+                id: id.into(),
+                message: format!(
+                    "runtime creation failed ({create_error}); runtime state could not be \
+                     inspected ({inspect_error}); the reservation was retained for reconciliation"
+                ),
+            }),
+        }
+    }
+
     /// Reconcile expired leases left by earlier wrapper processes.
     pub async fn reconcile(&self) -> Result<Vec<String>> {
         let now = Utc::now();
@@ -958,14 +989,23 @@ impl AgentSandbox {
 
     /// Recursively list regular artifacts without following symlinks.
     pub async fn artifacts(&self, id: &str) -> Result<Vec<Artifact>> {
-        self.require_session(id)?;
-        let mut pending = VecDeque::from(["/out".to_owned()]);
+        let session = self.require_session(id)?;
+        let layout = self.runtime.guest_layout_for(&session.backend)?;
+        let mut pending = VecDeque::from([layout.artifacts.clone()]);
         let mut artifacts = Vec::new();
         let mut total = 0_u64;
+        let mut entries_seen = 0_u64;
         let transfer = self.runtime.require_file_transfer_runtime()?;
         while let Some(directory) = pending.pop_front() {
             for entry in transfer.list_dir(id, &directory).await? {
-                let path = guest_child_path(&directory, &entry.path)?;
+                entries_seen = entries_seen.saturating_add(1);
+                if entries_seen > self.config.transfer.max_files {
+                    return Err(CoreError::InvalidOperation(format!(
+                        "artifact tree exceeds the host limit of {} entries",
+                        self.config.transfer.max_files
+                    )));
+                }
+                let path = guest_child_path(&layout.artifacts, &directory, &entry.path)?;
                 if entry.symlink {
                     return Err(CoreError::UnsafePath(format!(
                         "artifact symlink is not downloadable: {path}"
@@ -1000,8 +1040,9 @@ impl AgentSandbox {
         guest_path: &str,
         destination: impl AsRef<Path>,
     ) -> Result<()> {
-        self.require_session(id)?;
-        validate_artifact_path(guest_path)?;
+        let session = self.require_session(id)?;
+        let layout = self.runtime.guest_layout_for(&session.backend)?;
+        validate_artifact_path(guest_path, &layout.artifacts)?;
         let artifact = self
             .artifacts(id)
             .await?
@@ -1047,6 +1088,11 @@ impl AgentSandbox {
         &self.config
     }
 
+    /// Resolve the guest filesystem layout for a selected backend.
+    pub fn guest_layout(&self, backend: &BackendId) -> Result<GuestLayout> {
+        Ok(self.runtime.guest_layout_for(backend)?)
+    }
+
     async fn create(
         &self,
         options: SandboxOptions,
@@ -1055,9 +1101,12 @@ impl AgentSandbox {
     ) -> Result<OpenedSandbox> {
         let backend = match options.backend.clone() {
             Some(backend) => backend,
+            None if options.android_artifacts.is_some() => BackendId::cuttlefish(),
             None => BackendId::new(self.config.runtime.backend.clone())?,
         };
-        let requested_network = options.network;
+        let requested_network = options
+            .network
+            .or_else(|| (backend.as_str() == BackendId::CUTTLEFISH).then_some(NetworkMode::Off));
         let mut network_rules = options.network_rules;
         if requested_network == Some(NetworkMode::Dependencies) {
             network_rules.extend(dependency_network_rules(&options.project)?);
@@ -1065,6 +1114,7 @@ impl AgentSandbox {
         if options.machine.is_some()
             && (options.image.is_some()
                 || options.snapshot.is_some()
+                || options.android_artifacts.is_some()
                 || options
                     .environment
                     .as_deref()
@@ -1074,17 +1124,57 @@ impl AgentSandbox {
                 "machine boot inputs cannot be combined with --image, --snapshot, or --env".into(),
             ));
         }
-        let named_environment =
-            if options.machine.is_none() && options.image.is_none() && options.snapshot.is_none() {
-                options
+        if options.android_artifacts.is_some() && backend.as_str() != BackendId::CUTTLEFISH {
+            return Err(CoreError::InvalidOperation(
+                "Android artifacts require the cuttlefish backend".into(),
+            ));
+        }
+        if backend.as_str() == BackendId::CUTTLEFISH
+            && (options.image.is_some()
+                || options.snapshot.is_some()
+                || options.machine.is_some()
+                || options
                     .environment
                     .as_deref()
-                    .filter(|expression| *expression != "auto" && !expression.contains('@'))
-                    .map(str::to_owned)
-            } else {
-                None
-            };
-        let (resolved, named_record) = if let Some(machine) = options.machine {
+                    .is_some_and(|value| value != "auto"))
+        {
+            return Err(CoreError::InvalidOperation(
+                "Android artifacts cannot be combined with machine boot, --image, --snapshot, or a non-auto --env"
+                    .into(),
+            ));
+        }
+        let named_environment = if options.machine.is_none()
+            && options.android_artifacts.is_none()
+            && options.image.is_none()
+            && options.snapshot.is_none()
+        {
+            options
+                .environment
+                .as_deref()
+                .filter(|expression| *expression != "auto" && !expression.contains('@'))
+                .map(str::to_owned)
+        } else {
+            None
+        };
+        let (resolved, named_record) = if backend.as_str() == BackendId::CUTTLEFISH {
+            let artifacts = options
+                .android_artifacts
+                .or_else(|| self.config.cuttlefish.artifacts.clone())
+                .ok_or_else(|| {
+                    CoreError::InvalidOperation(
+                        "the cuttlefish backend requires --android-artifacts or cuttlefish.artifacts"
+                            .into(),
+                    )
+                })?;
+            (
+                ResolvedEnvironment {
+                    root: RootSource::Android(Box::new(AndroidBootSpec { artifacts })),
+                    detection: None,
+                    source: "Android Cuttlefish artifacts".into(),
+                },
+                None,
+            )
+        } else if let Some(machine) = options.machine {
             (
                 ResolvedEnvironment {
                     root: RootSource::Machine(Box::new(machine)),
@@ -1142,6 +1232,7 @@ impl AgentSandbox {
             &self.invocation_root,
         )?;
         let transfer = build_transfer_plan(&effective)?;
+        let guest_layout = self.runtime.guest_layout_for(&backend)?;
         let id = format!(
             "sbx_{}_{}",
             backend.as_str(),
@@ -1162,7 +1253,7 @@ impl AgentSandbox {
             effective.max_reserved_memory_mib,
         )?;
         if let Err(error) = self.runtime.create(&create_spec).await {
-            let _ = self.state.release(&id);
+            self.cleanup_failed_create(&id, &error).await?;
             return Err(error.into());
         }
         if let Err(error) = self.state.activate(&id) {
@@ -1171,7 +1262,9 @@ impl AgentSandbox {
         }
 
         if effective.project_mode != ProjectMode::None
-            && let Err(error) = self.prepare_workspace(&id, transfer.as_ref()).await
+            && let Err(error) = self
+                .prepare_workspace(&id, transfer.as_ref(), &guest_layout)
+                .await
         {
             let _ = self.cleanup(&id).await;
             return Err(error);
@@ -1189,6 +1282,13 @@ impl AgentSandbox {
                 backend: backend.clone(),
                 project: effective.project.clone(),
                 root: root_description(&resolved),
+                default_cwd: match effective.project_mode {
+                    ProjectMode::None => &guest_layout.root,
+                    ProjectMode::Copy
+                    | ProjectMode::MountReadOnly
+                    | ProjectMode::MountReadWrite => &guest_layout.workspace,
+                }
+                .into(),
                 created_at: now,
                 expires_at: now
                     + chrono::Duration::from_std(effective.ttl).unwrap_or(chrono::Duration::MAX),
@@ -1213,24 +1313,30 @@ impl AgentSandbox {
             project_mode: effective.project_mode,
             network: effective.network,
             ports,
+            guest_layout,
             ttl: effective.ttl,
             memory_tail_bytes: effective.memory_tail_bytes,
         })
     }
 
-    async fn prepare_workspace(&self, id: &str, plan: Option<&TransferPlan>) -> Result<()> {
+    async fn prepare_workspace(
+        &self,
+        id: &str,
+        plan: Option<&TransferPlan>,
+        layout: &GuestLayout,
+    ) -> Result<()> {
         let transfer = self.runtime.require_file_transfer_runtime()?;
         if plan.is_some() {
-            transfer.mkdir(id, "/workspace").await?;
+            transfer.mkdir(id, &layout.workspace).await?;
         }
-        transfer.mkdir(id, "/out").await?;
+        transfer.mkdir(id, &layout.artifacts).await?;
         let Some(plan) = plan else {
             return Ok(());
         };
         for entry in &plan.entries {
             match entry {
                 Entry::Directory { path, mode } => {
-                    let guest = guest_project_path(path)?;
+                    let guest = guest_project_path(&layout.workspace, path)?;
                     transfer.mkdir(id, &guest).await?;
                     transfer.set_mode(id, &guest, *mode).await?;
                 }
@@ -1238,13 +1344,18 @@ impl AgentSandbox {
                     path, source, mode, ..
                 } => {
                     transfer
-                        .put_file(id, source, &guest_project_path(path)?, *mode)
+                        .put_file(
+                            id,
+                            source,
+                            &guest_project_path(&layout.workspace, path)?,
+                            *mode,
+                        )
                         .await?;
                 }
                 Entry::Symlink { path, target } => {
                     let target = guest_symlink_target(path, target)?;
                     transfer
-                        .symlink(id, &target, &guest_project_path(path)?)
+                        .symlink(id, &target, &guest_project_path(&layout.workspace, path)?)
                         .await?;
                 }
             }
@@ -1425,7 +1536,7 @@ fn allocate_loopback_port() -> Result<u16> {
         })
 }
 
-fn guest_project_path(relative: &Path) -> Result<String> {
+fn guest_project_path(workspace: &str, relative: &Path) -> Result<String> {
     let mut components = Vec::new();
     for component in relative.components() {
         match component {
@@ -1441,7 +1552,11 @@ fn guest_project_path(relative: &Path) -> Result<String> {
             }
         }
     }
-    Ok(format!("/workspace/{}", components.join("/")))
+    Ok(format!(
+        "{}/{}",
+        workspace.trim_end_matches('/'),
+        components.join("/")
+    ))
 }
 
 fn guest_symlink_target(link: &Path, target: &Path) -> Result<String> {
@@ -1476,25 +1591,26 @@ fn guest_symlink_target(link: &Path, target: &Path) -> Result<String> {
     })
 }
 
-fn guest_child_path(parent: &str, entry_path: &str) -> Result<String> {
+fn guest_child_path(artifact_root: &str, parent: &str, entry_path: &str) -> Result<String> {
     let path = if entry_path.starts_with('/') {
         entry_path.to_owned()
     } else {
         format!("{}/{}", parent.trim_end_matches('/'), entry_path)
     };
-    validate_artifact_path(&path)?;
+    validate_artifact_path(&path, artifact_root)?;
     Ok(path)
 }
 
-fn validate_artifact_path(path: &str) -> Result<()> {
-    let relative = path.strip_prefix("/out/").unwrap_or_default();
+fn validate_artifact_path(path: &str, artifact_root: &str) -> Result<()> {
+    let prefix = format!("{}/", artifact_root.trim_end_matches('/'));
+    let relative = path.strip_prefix(&prefix).unwrap_or_default();
     if relative.is_empty()
         || relative
             .split('/')
             .any(|component| component.is_empty() || matches!(component, "." | ".."))
     {
         return Err(CoreError::UnsafePath(format!(
-            "artifact path must be an absolute regular file below /out: {path}"
+            "artifact path must be an absolute regular file below {artifact_root}: {path}"
         )));
     }
     Ok(())
@@ -1519,6 +1635,9 @@ fn root_description(resolved: &ResolvedEnvironment) -> String {
                 })
                 .unwrap_or_else(|| "unconfigured".into())
         ),
+        RootSource::Android(android) => {
+            format!("android:{}", android.artifacts.display())
+        }
         _ => "backend-defined".into(),
     }
 }
@@ -1549,6 +1668,7 @@ mod tests {
     struct MockState {
         existing: bool,
         inspect_error: bool,
+        fail_after_create: bool,
         created: Option<CreateSpec>,
         snapshots: BTreeMap<String, SnapshotInfo>,
         images: Vec<ImageInfo>,
@@ -1609,6 +1729,12 @@ mod tests {
             state.existing = true;
             state.created = Some(spec.clone());
             state.operations.push("create".into());
+            if state.fail_after_create {
+                return Err(RuntimeError::Backend {
+                    operation: "create",
+                    message: "failed after allocating runtime state".into(),
+                });
+            }
             Ok(info(&spec.id))
         }
 
@@ -1867,6 +1993,7 @@ mod tests {
             .open(SandboxOptions {
                 backend: Some(BackendId::microsandbox()),
                 machine: None,
+                android_artifacts: None,
                 project,
                 image: Some("alpine:3.22".into()),
                 snapshot: None,
@@ -1910,7 +2037,7 @@ mod tests {
     #[test]
     fn guest_artifact_paths_use_posix_rules_on_every_host() {
         for accepted in ["/out/report.txt", "/out/nested/report.txt"] {
-            validate_artifact_path(accepted).unwrap();
+            validate_artifact_path(accepted, "/out").unwrap();
         }
         for rejected in [
             "/out",
@@ -1920,7 +2047,10 @@ mod tests {
             "/out/./report.txt",
             "/out//report.txt",
         ] {
-            assert!(validate_artifact_path(rejected).is_err(), "{rejected}");
+            assert!(
+                validate_artifact_path(rejected, "/out").is_err(),
+                "{rejected}"
+            );
         }
     }
 
@@ -1978,6 +2108,47 @@ mod tests {
             ),
             Err(agent_sandbox_state::StateError::ConcurrencyLimit(1))
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_create_recovers_runtime_state_before_releasing_reservation() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let store = StateStore::open(root.path().join("state.db")).unwrap();
+        let runtime = Arc::new(MockRuntime::default());
+        runtime.state.lock().unwrap().fail_after_create = true;
+        let service = AgentSandbox::new(
+            runtime.clone(),
+            store.clone(),
+            HostConfig::default(),
+            root.path(),
+        )
+        .unwrap();
+
+        assert!(
+            service
+                .create_one_shot(options(&project, ProjectMode::None))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            runtime.state.lock().unwrap().operations,
+            vec!["create".to_owned(), "stop".to_owned(), "remove".to_owned()]
+        );
+
+        store
+            .reserve(
+                &ReservationRecord {
+                    id: "replacement".into(),
+                    memory_mib: 1,
+                    expires_at: Utc::now() + chrono::Duration::minutes(1),
+                    active: false,
+                },
+                1,
+                1024,
+            )
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2190,6 +2361,7 @@ mod tests {
         SandboxOptions {
             backend: Some(BackendId::microsandbox()),
             machine: None,
+            android_artifacts: None,
             project: project.into(),
             image: Some("alpine:3.22".into()),
             snapshot: None,

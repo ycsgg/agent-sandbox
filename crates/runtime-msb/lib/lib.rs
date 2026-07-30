@@ -583,9 +583,19 @@ impl MicrosandboxRuntime {
         let mut checks = Vec::new();
         for section in diagnosis.sections {
             for check in section.checks {
+                let passed = !matches!(check.state, CheckState::Fail);
+                let label = if section.title == "Runtime" && check.label == "Version" {
+                    "SDK version"
+                } else {
+                    check.label.as_str()
+                };
+                if section.title == "Runtime" && check.label == "msb" && passed {
+                    let (version_passed, version) = installed_msb_version(&check.value).await;
+                    checks.push(("Runtime / msb version".into(), version_passed, version));
+                }
                 checks.push((
-                    format!("{} / {}", section.title, check.label),
-                    !matches!(check.state, CheckState::Fail),
+                    format!("{} / {}", section.title, label),
+                    passed,
                     check.value,
                 ));
             }
@@ -594,6 +604,34 @@ impl MicrosandboxRuntime {
             checks.push(("Problem".into(), false, problem.headline));
         }
         Ok(checks)
+    }
+}
+
+async fn installed_msb_version(path: &str) -> (bool, String) {
+    let output = match tokio::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => return (false, format!("could not run msb: {error}")),
+    };
+    if !output.status.success() {
+        return (
+            false,
+            format!("msb --version exited with {}", output.status),
+        );
+    }
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(stdout) => stdout,
+        Err(error) => return (false, format!("msb --version was not UTF-8: {error}")),
+    };
+    match stdout.trim().strip_prefix("msb ") {
+        Some(version) if !version.is_empty() => (true, format!("v{version}")),
+        _ => (
+            false,
+            format!("unexpected msb --version output: {:?}", stdout.trim()),
+        ),
     }
 }
 

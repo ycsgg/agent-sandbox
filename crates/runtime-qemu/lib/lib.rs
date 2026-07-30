@@ -119,6 +119,10 @@ impl QemuRuntime {
         SshTools::resolve(self.config.ssh_binary.as_deref(), Duration::from_secs(5))
     }
 
+    fn ssh_transport_enabled(&self) -> bool {
+        self.config.ssh_user.is_some()
+    }
+
     async fn qmp(&self, state: &MachineState, command: &str) -> Result<serde_json::Value> {
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -197,18 +201,24 @@ impl SandboxRuntime for QemuRuntime {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        BackendCapabilities {
-            backend: self.backend_id(),
-            boot_sources: vec![BootSourceKind::DiskImage, BootSourceKind::DirectKernel],
-            features: vec![
+        let mut features = Vec::new();
+        if self.ssh_transport_enabled() {
+            features.extend([
                 RuntimeFeature::Exec,
                 RuntimeFeature::Attach,
                 RuntimeFeature::FileTransfer,
-                RuntimeFeature::PortForward,
-                RuntimeFeature::SerialLog,
-                RuntimeFeature::MachineControl,
-                RuntimeFeature::GdbStub,
-            ],
+            ]);
+        }
+        features.extend([
+            RuntimeFeature::PortForward,
+            RuntimeFeature::SerialLog,
+            RuntimeFeature::MachineControl,
+            RuntimeFeature::GdbStub,
+        ]);
+        BackendCapabilities {
+            backend: self.backend_id(),
+            boot_sources: vec![BootSourceKind::DiskImage, BootSourceKind::DirectKernel],
+            features,
             architectures: vec!["x86_64".into(), "aarch64".into(), "riscv64".into()],
             accelerators: vec![
                 "auto".into(),
@@ -221,15 +231,18 @@ impl SandboxRuntime for QemuRuntime {
     }
 
     fn command_runtime(&self) -> Option<&dyn CommandRuntime> {
-        Some(self)
+        self.ssh_transport_enabled()
+            .then_some(self as &dyn CommandRuntime)
     }
 
     fn terminal_runtime(&self) -> Option<&dyn TerminalRuntime> {
-        Some(self)
+        self.ssh_transport_enabled()
+            .then_some(self as &dyn TerminalRuntime)
     }
 
     fn file_transfer_runtime(&self) -> Option<&dyn FileTransferRuntime> {
-        Some(self)
+        self.ssh_transport_enabled()
+            .then_some(self as &dyn FileTransferRuntime)
     }
 
     fn debug_runtime(&self) -> Option<&dyn DebugRuntime> {
@@ -242,6 +255,11 @@ impl SandboxRuntime for QemuRuntime {
                 "QEMU received a create request for backend {:?}",
                 spec.backend
             )));
+        }
+        if spec.user.is_some() && !self.ssh_transport_enabled() {
+            return Err(RuntimeError::Configuration(
+                "QEMU --user requires guest transport; configure qemu.ssh_user first".into(),
+            ));
         }
         let directory = self.machine_dir(&spec.id)?;
         if directory.exists() {
@@ -257,7 +275,11 @@ impl SandboxRuntime for QemuRuntime {
         let serial_log = directory.join("serial.log");
         let process_log = directory.join("qemu.log");
         let qmp_port = allocate_loopback_port()?;
-        let ssh_user = spec.user.clone().or_else(|| self.config.ssh_user.clone());
+        let ssh_user = self
+            .config
+            .ssh_user
+            .clone()
+            .map(|default| spec.user.clone().unwrap_or(default));
         if ssh_user.is_some()
             && let Some(key) = &self.config.ssh_key
             && !key.is_file()
@@ -846,7 +868,7 @@ impl QemuRuntime {
                 (_, Err(error)) => ("QEMU / accelerator".into(), false, error.to_string()),
             });
         }
-        if self.config.ssh_user.is_some() {
+        if self.ssh_transport_enabled() {
             checks.push(
                 match (
                     self.config.ssh_key.as_ref().is_none_or(|key| key.is_file()),
@@ -1095,6 +1117,54 @@ mod tests {
     fn rejects_state_path_traversal() {
         assert!(validate_sandbox_id("../other").is_err());
         assert!(validate_sandbox_id("sbx_qemu_good-1").is_ok());
+    }
+
+    #[test]
+    fn transport_capabilities_follow_ssh_configuration() {
+        let directory = tempdir().unwrap();
+        let without_ssh = QemuRuntime::new(QemuRuntimeConfig {
+            home: directory.path().join("without-ssh"),
+            binary: None,
+            ssh_binary: None,
+            ssh_user: None,
+            ssh_key: None,
+            boot_timeout: Duration::from_secs(1),
+            shutdown_timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+        let without_features = without_ssh.capabilities().features;
+        for feature in [
+            RuntimeFeature::Exec,
+            RuntimeFeature::Attach,
+            RuntimeFeature::FileTransfer,
+        ] {
+            assert!(!without_features.contains(&feature));
+        }
+        assert!(without_ssh.command_runtime().is_none());
+        assert!(without_ssh.terminal_runtime().is_none());
+        assert!(without_ssh.file_transfer_runtime().is_none());
+
+        let with_ssh = QemuRuntime::new(QemuRuntimeConfig {
+            home: directory.path().join("with-ssh"),
+            binary: None,
+            ssh_binary: None,
+            ssh_user: Some("root".into()),
+            ssh_key: None,
+            boot_timeout: Duration::from_secs(1),
+            shutdown_timeout: Duration::from_secs(1),
+        })
+        .unwrap();
+        let with_features = with_ssh.capabilities().features;
+        for feature in [
+            RuntimeFeature::Exec,
+            RuntimeFeature::Attach,
+            RuntimeFeature::FileTransfer,
+        ] {
+            assert!(with_features.contains(&feature));
+        }
+        assert!(with_ssh.command_runtime().is_some());
+        assert!(with_ssh.terminal_runtime().is_some());
+        assert!(with_ssh.file_transfer_runtime().is_some());
     }
 
     #[tokio::test]

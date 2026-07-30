@@ -63,6 +63,8 @@ impl BackendId {
     pub const MICROSANDBOX: &'static str = "microsandbox";
     /// QEMU backend identifier.
     pub const QEMU: &'static str = "qemu";
+    /// Android Cuttlefish backend identifier.
+    pub const CUTTLEFISH: &'static str = "cuttlefish";
 
     /// Parse and validate a backend identifier.
     pub fn new(value: impl Into<String>) -> Result<Self> {
@@ -93,6 +95,11 @@ impl BackendId {
     /// Construct the QEMU identifier.
     pub fn qemu() -> Self {
         Self(Self::QEMU.into())
+    }
+
+    /// Construct the Android Cuttlefish identifier.
+    pub fn cuttlefish() -> Self {
+        Self(Self::CUTTLEFISH.into())
     }
 }
 
@@ -129,6 +136,8 @@ pub enum BootSourceKind {
     DiskImage,
     /// Direct kernel boot, optionally with a disk and initrd.
     DirectKernel,
+    /// Extracted Android Cuttlefish host tools and device images.
+    AndroidArtifacts,
 }
 
 /// Independently discoverable runtime operation.
@@ -291,6 +300,15 @@ pub enum RootSource {
     Snapshot(String),
     /// A bootable virtual-machine definition.
     Machine(Box<MachineBootSpec>),
+    /// An extracted Android Cuttlefish artifact directory.
+    Android(Box<AndroidBootSpec>),
+}
+
+/// Android Cuttlefish host tools and matching device-image inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AndroidBootSpec {
+    /// Canonical directory containing `bin/launch_cvd`, `bin/adb`, and images.
+    pub artifacts: PathBuf,
 }
 
 /// QEMU-compatible virtual disk image format.
@@ -577,6 +595,30 @@ pub struct GuestEntry {
     pub mode: u32,
 }
 
+/// Backend-specific guest filesystem locations exposed to callers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestLayout {
+    /// Default working directory when no project is exposed.
+    pub root: String,
+    /// Project-copy destination and default project working directory.
+    pub workspace: String,
+    /// Directory scanned by the artifact broker.
+    pub artifacts: String,
+    /// Default interactive shell.
+    pub shell: String,
+}
+
+impl Default for GuestLayout {
+    fn default() -> Self {
+        Self {
+            root: "/".into(),
+            workspace: "/workspace".into(),
+            artifacts: "/out".into(),
+            shell: "/bin/sh".into(),
+        }
+    }
+}
+
 //--------------------------------------------------------------------------------------------------
 // Traits
 //--------------------------------------------------------------------------------------------------
@@ -674,6 +716,19 @@ pub trait SandboxRuntime: Send + Sync {
 
     /// Static backend capabilities.
     fn capabilities(&self) -> BackendCapabilities;
+
+    /// Guest filesystem layout used by backend-neutral orchestration.
+    fn guest_layout(&self) -> GuestLayout {
+        GuestLayout::default()
+    }
+
+    /// Resolve a guest layout for a selected backend.
+    ///
+    /// Registry facades override this to route by backend. A concrete runtime
+    /// has only one layout, so the default returns that layout.
+    fn guest_layout_for(&self, _backend: &BackendId) -> Result<GuestLayout> {
+        Ok(self.guest_layout())
+    }
 
     /// Non-interactive command capability, when supported.
     fn command_runtime(&self) -> Option<&dyn CommandRuntime> {

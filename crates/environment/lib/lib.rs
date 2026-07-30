@@ -101,7 +101,7 @@ pub fn resolve(
 ) -> Result<ResolvedEnvironment, EnvironmentError> {
     if let Some(image) = nonempty(request.image.as_deref()) {
         return Ok(ResolvedEnvironment {
-            root: RootSource::Image(image.to_owned()),
+            root: RootSource::Image(normalize_image_reference(image)),
             detection: None,
             source: "--image".into(),
         });
@@ -179,7 +179,34 @@ pub fn resolve_language(expression: &str) -> Result<String, EnvironmentError> {
             )));
         }
     };
-    Ok(image)
+    Ok(normalize_image_reference(&image))
+}
+
+/// Expand Docker Hub's familiar image syntax to its current registry endpoint.
+///
+/// OCI clients do not all implement Docker's implicit registry and `library/`
+/// rules. In particular, treating a bare name as `index.docker.io` can select
+/// the legacy website endpoint instead of the registry API.
+pub fn normalize_image_reference(image: &str) -> String {
+    const DOCKER_HUB: &str = "registry-1.docker.io";
+
+    let Some((first, remainder)) = image.split_once('/') else {
+        return format!("{DOCKER_HUB}/library/{image}");
+    };
+
+    if matches!(first, "docker.io" | "index.docker.io" | DOCKER_HUB) {
+        return if remainder.contains('/') {
+            format!("{DOCKER_HUB}/{remainder}")
+        } else {
+            format!("{DOCKER_HUB}/library/{remainder}")
+        };
+    }
+
+    if first == "localhost" || first.contains('.') || first.contains(':') {
+        image.into()
+    } else {
+        format!("{DOCKER_HUB}/{image}")
+    }
 }
 
 /// Validate and normalize one named environment build request.
@@ -189,7 +216,8 @@ pub fn build_request(
     toolchains: &[String],
 ) -> Result<EnvironmentBuild, EnvironmentError> {
     validate_name(name)?;
-    validate_base(base)?;
+    let base = normalize_image_reference(base);
+    validate_base(&base)?;
     if toolchains.is_empty() {
         return Err(EnvironmentError::Unsupported(
             "at least one --toolchain LANG@VERSION is required".into(),
@@ -204,7 +232,7 @@ pub fn build_request(
     let arch = guest_arch()?;
     Ok(recompute_cache_key(EnvironmentBuild {
         name: name.into(),
-        base: base.into(),
+        base,
         base_digest: None,
         toolchains,
         arch: arch.into(),
@@ -488,9 +516,46 @@ mod tests {
 
     #[test]
     fn resolves_official_fast_path_images() {
-        assert_eq!(resolve_language("go@1.24").unwrap(), "golang:1.24-bookworm");
-        assert_eq!(resolve_language("node@22").unwrap(), "node:22-bookworm");
-        assert_eq!(resolve_language("rust@1.88").unwrap(), "rust:1.88-bookworm");
+        assert_eq!(
+            resolve_language("go@1.24").unwrap(),
+            "registry-1.docker.io/library/golang:1.24-bookworm"
+        );
+        assert_eq!(
+            resolve_language("node@22").unwrap(),
+            "registry-1.docker.io/library/node:22-bookworm"
+        );
+        assert_eq!(
+            resolve_language("rust@1.88").unwrap(),
+            "registry-1.docker.io/library/rust:1.88-bookworm"
+        );
+    }
+
+    #[test]
+    fn normalizes_docker_hub_references_without_rewriting_other_registries() {
+        assert_eq!(
+            normalize_image_reference("alpine:3.20"),
+            "registry-1.docker.io/library/alpine:3.20"
+        );
+        assert_eq!(
+            normalize_image_reference("acme/tool:latest"),
+            "registry-1.docker.io/acme/tool:latest"
+        );
+        assert_eq!(
+            normalize_image_reference("docker.io/alpine@sha256:abc"),
+            "registry-1.docker.io/library/alpine@sha256:abc"
+        );
+        assert_eq!(
+            normalize_image_reference("index.docker.io/library/alpine"),
+            "registry-1.docker.io/library/alpine"
+        );
+        assert_eq!(
+            normalize_image_reference("ghcr.io/acme/tool:latest"),
+            "ghcr.io/acme/tool:latest"
+        );
+        assert_eq!(
+            normalize_image_reference("localhost:5000/acme/tool"),
+            "localhost:5000/acme/tool"
+        );
     }
 
     #[test]

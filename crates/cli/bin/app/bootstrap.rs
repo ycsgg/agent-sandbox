@@ -8,6 +8,7 @@ use std::{
 use agent_sandbox_core::AgentSandbox;
 use agent_sandbox_policy::{HostConfig, parse_duration};
 use agent_sandbox_runtime::{BackendId, RuntimeRegistry};
+use agent_sandbox_runtime_cuttlefish::{CuttlefishRuntime, CuttlefishRuntimeConfig};
 use agent_sandbox_runtime_msb::MicrosandboxRuntime;
 use agent_sandbox_runtime_qemu::{QemuRuntime, QemuRuntimeConfig};
 use agent_sandbox_state::StateStore;
@@ -44,6 +45,15 @@ impl Application {
             ssh_key: config.qemu.ssh_key.clone(),
             boot_timeout: parse_duration(&config.qemu.boot_timeout)?,
             shutdown_timeout: parse_duration(&config.qemu.shutdown_timeout)?,
+        })?))?;
+        runtimes.register(Arc::new(CuttlefishRuntime::new(CuttlefishRuntimeConfig {
+            home: state_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join("cuttlefish"),
+            artifacts: config.cuttlefish.artifacts.clone(),
+            boot_timeout: parse_duration(&config.cuttlefish.boot_timeout)?,
+            shutdown_timeout: parse_duration(&config.cuttlefish.shutdown_timeout)?,
         })?))?;
         runtimes.validate()?;
 

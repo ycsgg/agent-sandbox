@@ -13,6 +13,25 @@ max_ttl = "8h"
 boot_timeout = "2m"
 shutdown_timeout = "10s"
 
+[cuttlefish]
+# Combined directory produced by extracting a matching cvd-host_package.tar.gz
+# and Android Cuttlefish device-image archive.
+# Install the Cuttlefish Linux host packages separately. Offline mode requires
+# host tools new enough to support --enable_tap_devices (2025-03 or newer).
+# artifacts = "/opt/android/cuttlefish"
+boot_timeout = "5m"
+shutdown_timeout = "30s"
+
+[proxy]
+# Standard HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY values are inherited by default.
+inherit_env = true
+# http = "http://127.0.0.1:7890"
+# https = "http://127.0.0.1:7890"
+# all = "http://127.0.0.1:7890"
+no_proxy = []
+# Leave disabled for localhost proxies; the guest has a different loopback.
+inject_guest = false
+
 [workspace]
 roots = []
 allow_rw_mount = false
@@ -20,6 +39,7 @@ rw_mount_quota = "2G"
 
 [network]
 default = "public"
+# Required only for an explicit Cuttlefish/QEMU --network all request.
 allow_all_mode = false
 allow_private_override = false
 allow_non_loopback_publish = false

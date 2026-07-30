@@ -10,9 +10,9 @@ use async_trait::async_trait;
 
 use crate::{
     BackendCapabilities, BackendId, CommandRuntime, CreateSpec, DebugContext, DebugRuntime,
-    ExecRequest, ExecStream, FileTransferRuntime, GuestEntry, ImageInfo, ImageRuntime, Result,
-    RuntimeError, RuntimeFeature, SandboxInfo, SandboxRuntime, SnapshotInfo, SnapshotRuntime,
-    TerminalRuntime,
+    ExecRequest, ExecStream, FileTransferRuntime, GuestEntry, GuestLayout, ImageInfo, ImageRuntime,
+    Result, RuntimeError, RuntimeFeature, SandboxInfo, SandboxRuntime, SnapshotInfo,
+    SnapshotRuntime, TerminalRuntime,
 };
 
 /// A runtime facade that selects a backend at creation time and routes later
@@ -102,6 +102,11 @@ impl RuntimeRegistry {
         self.backend(backend)?.doctor().await
     }
 
+    /// Return the guest filesystem layout declared by one backend.
+    pub fn guest_layout_for(&self, backend: &BackendId) -> Result<GuestLayout> {
+        Ok(self.backend(backend)?.guest_layout())
+    }
+
     fn backend(&self, backend: &BackendId) -> Result<Arc<dyn SandboxRuntime>> {
         self.backends.get(backend).cloned().ok_or_else(|| {
             RuntimeError::Configuration(format!("backend {backend:?} is not registered"))
@@ -172,6 +177,17 @@ impl SandboxRuntime for RuntimeRegistry {
             architectures: architectures.into_iter().collect(),
             accelerators: accelerators.into_iter().collect(),
         }
+    }
+
+    fn guest_layout(&self) -> GuestLayout {
+        self.backends
+            .get(&self.default_backend)
+            .map(|backend| backend.guest_layout())
+            .unwrap_or_default()
+    }
+
+    fn guest_layout_for(&self, backend: &BackendId) -> Result<GuestLayout> {
+        RuntimeRegistry::guest_layout_for(self, backend)
     }
 
     fn command_runtime(&self) -> Option<&dyn CommandRuntime> {
