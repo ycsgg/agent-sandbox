@@ -6,7 +6,7 @@ Agent Sandbox 是面向 coding agent 的本地隔离运行时。机器维护者�
 `asbx` CLI、准备一个或多个虚拟化后端，并安装项目自带的 Agent Skill；之后由
 Agent 自行判断何时以及如何创建一次性 sandbox。
 
-它不是供人日常操作的通用虚拟机管理器，也不是交互式应用：
+接入关系如下：
 
 ```text
 Codex / Claude Code / Cursor / Gemini CLI / OpenCode
@@ -18,8 +18,8 @@ Codex / Claude Code / Cursor / Gemini CLI / OpenCode
         Microsandbox / QEMU / Cuttlefish / Android Emulator
 ```
 
-因此，这份 README 面向负责部署机器或接入新后端的人。供 Agent 使用的工作流和
-命令选择规则位于项目自带的
+这份 README 面向负责部署机器或接入新后端的人。供 Agent 使用的工作流和命令
+选择规则位于项目自带的
 [`agent-sandbox` Skill](skill/agent-sandbox/SKILL.md)。
 
 ## 安装 CLI

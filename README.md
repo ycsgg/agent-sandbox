@@ -7,8 +7,7 @@ the `asbx` CLI, prepares one or more virtualization backends, and installs the
 bundled Agent Skill. The agent then decides when and how to create disposable
 sandboxes.
 
-It is not intended to be a general-purpose VM manager or an interactive
-application for humans:
+The integration path is:
 
 ```text
 Codex / Claude Code / Cursor / Gemini CLI / OpenCode
@@ -20,9 +19,9 @@ Codex / Claude Code / Cursor / Gemini CLI / OpenCode
         Microsandbox / QEMU / Cuttlefish / Android Emulator
 ```
 
-This README is therefore for the person who provisions the machine or
-integrates another backend. Agent workflows and command-selection guidance live
-in the bundled [`agent-sandbox` Skill](skill/agent-sandbox/SKILL.md).
+This README is for the person who provisions the machine or integrates another
+backend. Agent workflows and command-selection guidance live in the bundled
+[`agent-sandbox` Skill](skill/agent-sandbox/SKILL.md).
 
 ## Install the CLI
 
