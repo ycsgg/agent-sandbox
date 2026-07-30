@@ -165,9 +165,20 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert!(values.contains(&("ALL_PROXY".into(), Some("http://127.0.0.1:7890".into()))));
-        assert!(values.contains(&("all_proxy".into(), Some("http://127.0.0.1:7890".into()))));
-        assert!(values.contains(&("NO_PROXY".into(), Some("localhost".into()))));
-        assert!(values.contains(&("no_proxy".into(), Some("localhost".into()))));
+        if cfg!(windows) {
+            for (key, expected) in [
+                ("ALL_PROXY", "http://127.0.0.1:7890"),
+                ("NO_PROXY", "localhost"),
+            ] {
+                assert!(values.iter().any(|(candidate, value)| {
+                    candidate.eq_ignore_ascii_case(key) && value.as_deref() == Some(expected)
+                }));
+            }
+        } else {
+            assert!(values.contains(&("ALL_PROXY".into(), Some("http://127.0.0.1:7890".into()))));
+            assert!(values.contains(&("all_proxy".into(), Some("http://127.0.0.1:7890".into()))));
+            assert!(values.contains(&("NO_PROXY".into(), Some("localhost".into()))));
+            assert!(values.contains(&("no_proxy".into(), Some("localhost".into()))));
+        }
     }
 }
