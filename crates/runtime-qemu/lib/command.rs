@@ -374,10 +374,8 @@ mod tests {
     #[test]
     fn builds_direct_kernel_command_with_safe_defaults() {
         let directory = tempdir().unwrap();
-        let binary = directory.path().join("qemu-system-aarch64");
+        let binary = fake_executable(directory.path(), "qemu-system-aarch64");
         let kernel = directory.path().join("Image");
-        std::fs::write(&binary, []).unwrap();
-        make_executable(&binary);
         std::fs::write(&kernel, []).unwrap();
         let config = QemuRuntimeConfig {
             home: directory.path().join("home"),
@@ -450,10 +448,8 @@ mod tests {
     #[test]
     fn writable_disk_uses_temporary_snapshot() {
         let directory = tempdir().unwrap();
-        let binary = directory.path().join("qemu-system-x86_64");
+        let binary = fake_executable(directory.path(), "qemu-system-x86_64");
         let disk = directory.path().join("root.qcow2");
-        std::fs::write(&binary, []).unwrap();
-        make_executable(&binary);
         std::fs::write(&disk, []).unwrap();
         let config = QemuRuntimeConfig {
             home: directory.path().join("home"),
@@ -527,6 +523,15 @@ mod tests {
             ephemeral: true,
             detached: true,
         }
+    }
+
+    fn fake_executable(directory: &Path, name: &str) -> PathBuf {
+        let path = directory
+            .join(name)
+            .with_extension(std::env::consts::EXE_EXTENSION);
+        std::fs::write(&path, []).unwrap();
+        make_executable(&path);
+        path
     }
 
     #[cfg(unix)]
