@@ -127,8 +127,11 @@ enum Command {
 #[derive(Debug, Args)]
 struct SetupArgs {
     /// Inspect setup state without changing the host.
-    #[arg(long, conflicts_with = "yes")]
+    #[arg(long, conflicts_with_all = ["yes", "dry_run"])]
     check: bool,
+    /// Build and display the selected setup plan without applying it.
+    #[arg(long, conflicts_with_all = ["yes", "check"])]
+    dry_run: bool,
     /// Set the backend used when --backend is omitted.
     #[arg(long, value_enum)]
     default_backend: Option<SetupBackendArg>,
@@ -773,5 +776,17 @@ mod tests {
             arguments.install_backends,
             [SetupBackendArg::AndroidEmulator]
         );
+    }
+
+    #[test]
+    fn setup_accepts_dry_run_and_rejects_apply_flags() {
+        let cli = Cli::try_parse_from(["asbx", "setup", "--dry-run"]).unwrap();
+        let Command::Setup(arguments) = cli.command else {
+            panic!("setup command was not parsed");
+        };
+        assert!(arguments.dry_run);
+
+        assert!(Cli::try_parse_from(["asbx", "setup", "--dry-run", "--yes"]).is_err());
+        assert!(Cli::try_parse_from(["asbx", "setup", "--dry-run", "--check"]).is_err());
     }
 }

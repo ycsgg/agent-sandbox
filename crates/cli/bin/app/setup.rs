@@ -18,6 +18,7 @@ use agent_sandbox_runtime_cuttlefish::{CuttlefishRuntime, CuttlefishRuntimeConfi
 use agent_sandbox_runtime_msb::MicrosandboxRuntime;
 use agent_sandbox_runtime_qemu::{QemuRuntime, QemuRuntimeConfig};
 use anyhow::{Context, Result, bail};
+use console::Style;
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 use tokio::process::Command;
@@ -185,6 +186,13 @@ struct BackendProbe {
     view: BackendView,
     missing_runtime: bool,
     install_can_fix: bool,
+    host_supported: bool,
+}
+
+struct SetupChoices {
+    target_default: String,
+    desired_backends: BTreeSet<String>,
+    selected_harnesses: BTreeSet<SetupHarnessArg>,
 }
 
 /// Run setup without constructing normal runtime state or reconciling sessions.
@@ -200,26 +208,57 @@ pub(super) async fn run(config_argument: Option<&Path>, arguments: SetupArgs) ->
         HostConfig::default()
     };
     let home = dirs::home_dir().context("cannot determine the user home directory")?;
+    let harness_specs = harness_specs();
+    let wizard = should_run_wizard(&arguments);
 
-    let target_default = arguments
-        .default_backend
-        .map(SetupBackendArg::as_str)
-        .unwrap_or(config.runtime.backend.as_str())
-        .to_owned();
-    let mut desired_backends = arguments
-        .install_backends
-        .iter()
-        .map(|backend| backend.as_str().to_owned())
-        .collect::<BTreeSet<_>>();
-    desired_backends.insert(target_default.clone());
+    if wizard {
+        cliclack::intro("Agent Sandbox setup").context("render setup intro")?;
+        cliclack::log::remark(format!(
+            "{} {}  ·  {}",
+            friendly_os(env::consts::OS),
+            friendly_architecture(env::consts::ARCH),
+            config_path.display()
+        ))
+        .context("render setup host")?;
+    }
 
-    let mut backend_probes = probe_backends(&config).await?;
+    let mut backend_probes = if wizard {
+        let progress = cliclack::spinner();
+        progress.start("Inspecting runtime backends");
+        match probe_backends(&config).await {
+            Ok(probes) => {
+                progress.stop("Runtime inspection complete");
+                probes
+            }
+            Err(error) => {
+                progress.error("Runtime inspection failed");
+                return Err(error);
+            }
+        }
+    } else {
+        probe_backends(&config).await?
+    };
+
+    let choices = if wizard {
+        let Some(choices) = prompt_setup_choices(&config, &backend_probes, &harness_specs, &home)?
+        else {
+            cliclack::outro_cancel("Setup cancelled").context("render setup cancellation")?;
+            return Ok(0);
+        };
+        choices
+    } else {
+        choices_from_arguments(&arguments, &config, &harness_specs, &home)
+    };
+    let SetupChoices {
+        target_default,
+        desired_backends,
+        selected_harnesses,
+    } = choices;
+
     for probe in &mut backend_probes {
         probe.view.selected = desired_backends.contains(&probe.view.id);
     }
 
-    let harness_specs = harness_specs();
-    let selected_harnesses = select_harnesses(&arguments, &harness_specs, &home);
     let mut target_harnesses = BTreeMap::<PathBuf, Vec<String>>::new();
     for specification in &harness_specs {
         if selected_harnesses.contains(&specification.id) {
@@ -232,6 +271,10 @@ pub(super) async fn run(config_argument: Option<&Path>, arguments: SetupArgs) ->
 
     let mut actions = Vec::new();
     let mut blockers = Vec::new();
+    let plan_progress = wizard.then(cliclack::spinner);
+    if let Some(progress) = &plan_progress {
+        progress.start("Building setup plan");
+    }
     plan_backends(
         &config,
         &desired_backends,
@@ -240,12 +283,15 @@ pub(super) async fn run(config_argument: Option<&Path>, arguments: SetupArgs) ->
         &mut blockers,
     )
     .await;
+    if let Some(progress) = &plan_progress {
+        progress.stop("Setup plan ready");
+    }
 
     if !is_known_backend(&target_default) {
         blockers.push(format!(
             "configured default backend {target_default:?} is unknown; rerun with --default-backend microsandbox, qemu, cuttlefish, or android-emulator"
         ));
-    } else if !config_path.exists() || config.runtime.backend != target_default {
+    } else if !wizard && (!config_path.exists() || config.runtime.backend != target_default) {
         actions.push(Action::WriteConfig {
             path: config_path.clone(),
             backend: target_default.clone(),
@@ -323,6 +369,8 @@ pub(super) async fn run(config_argument: Option<&Path>, arguments: SetupArgs) ->
 
     if arguments.json {
         println!("{}", serde_json::to_string_pretty(&snapshot)?);
+    } else if wizard {
+        print_wizard_review(&snapshot)?;
     } else {
         print_snapshot(&snapshot);
     }
@@ -336,25 +384,417 @@ pub(super) async fn run(config_argument: Option<&Path>, arguments: SetupArgs) ->
             },
         );
     }
+    if arguments.dry_run {
+        let succeeded = snapshot.blockers.is_empty();
+        if wizard {
+            if succeeded {
+                cliclack::outro("Dry run complete · no changes applied")
+                    .context("render dry-run completion")?;
+            } else {
+                cliclack::outro_cancel("Dry run found blockers · no changes applied")
+                    .context("render dry-run completion")?;
+            }
+        } else {
+            println!("\nDry run complete. No changes applied.");
+        }
+        return Ok(if succeeded { 0 } else { 1 });
+    }
     if !snapshot.blockers.is_empty() {
+        if wizard {
+            cliclack::outro_cancel("Resolve the blockers above, then run setup again")
+                .context("render blocked setup")?;
+            return Ok(1);
+        }
         bail!("setup has unresolved blockers; no changes were applied");
     }
     if actions.is_empty() {
-        if !arguments.json {
+        if wizard {
+            cliclack::outro("Everything is already configured")
+                .context("render setup completion")?;
+        } else if !arguments.json {
             println!("\nNo changes required.");
         }
         return Ok(0);
     }
-    if !arguments.yes && !confirm(actions.len())? {
-        println!("No changes applied.");
+    let confirmed = if arguments.yes {
+        true
+    } else if wizard {
+        match cliclack::confirm(format!("Apply {} change(s)?", actions.len()))
+            .initial_value(false)
+            .interact()
+        {
+            Ok(confirmed) => confirmed,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => false,
+            Err(error) => return Err(error).context("read setup confirmation"),
+        }
+    } else {
+        confirm(actions.len())?
+    };
+    if !confirmed {
+        if wizard {
+            cliclack::outro_cancel("No changes applied").context("render setup cancellation")?;
+        } else {
+            println!("No changes applied.");
+        }
         return Ok(0);
     }
 
-    apply_backend_actions(&actions).await?;
-    verify_requested_backends(&config, &desired_backends).await?;
-    apply_configuration_actions(&actions)?;
-    println!("Setup complete. Run `asbx setup --check` to verify it again.");
+    if wizard {
+        apply_actions_with_progress(&actions, &config, &desired_backends).await?;
+        cliclack::outro("Setup complete · run `asbx setup --check` to verify")
+            .context("render setup completion")?;
+    } else {
+        apply_backend_actions(&actions).await?;
+        verify_requested_backends(&config, &desired_backends).await?;
+        apply_configuration_actions(&actions)?;
+        println!("Setup complete. Run `asbx setup --check` to verify it again.");
+    }
     Ok(0)
+}
+
+fn should_run_wizard(arguments: &SetupArgs) -> bool {
+    !arguments.check
+        && !arguments.yes
+        && !has_explicit_choices(arguments)
+        && io::stdin().is_terminal()
+        && io::stderr().is_terminal()
+}
+
+fn has_explicit_choices(arguments: &SetupArgs) -> bool {
+    arguments.default_backend.is_some()
+        || !arguments.install_backends.is_empty()
+        || !arguments.harnesses.is_empty()
+        || arguments.no_harness
+}
+
+fn choices_from_arguments(
+    arguments: &SetupArgs,
+    config: &HostConfig,
+    harness_specs: &[HarnessSpec],
+    home: &Path,
+) -> SetupChoices {
+    let target_default = arguments
+        .default_backend
+        .map(SetupBackendArg::as_str)
+        .unwrap_or(config.runtime.backend.as_str())
+        .to_owned();
+    let mut desired_backends = arguments
+        .install_backends
+        .iter()
+        .map(|backend| backend.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    desired_backends.insert(target_default.clone());
+    SetupChoices {
+        target_default,
+        desired_backends,
+        selected_harnesses: select_harnesses(arguments, harness_specs, home),
+    }
+}
+
+fn prompt_setup_choices(
+    config: &HostConfig,
+    probes: &[BackendProbe],
+    harness_specs: &[HarnessSpec],
+    home: &Path,
+) -> Result<Option<SetupChoices>> {
+    let selectable_backends = selectable_backend_options(probes);
+    if selectable_backends.is_empty() {
+        bail!("no runtime backend supports this host");
+    }
+    for backend in unavailable_backend_options(probes) {
+        let probe = probes
+            .iter()
+            .find(|probe| probe.view.id == backend.as_str())
+            .context("unavailable backend probe disappeared")?;
+        cliclack::log::remark(format!(
+            "✕ {:<18} {}",
+            backend.label(),
+            backend_unavailable_hint(probe)
+        ))
+        .context("render unavailable backend")?;
+    }
+
+    let mut initially_selected = selectable_backends
+        .iter()
+        .copied()
+        .filter(|backend| {
+            probes
+                .iter()
+                .any(|probe| probe.view.id == backend.as_str() && probe.view.status == "ready")
+        })
+        .collect::<Vec<_>>();
+    if initially_selected.is_empty() {
+        let configured = setup_backend_from_name(&config.runtime.backend)
+            .filter(|backend| selectable_backends.contains(backend));
+        initially_selected.push(configured.unwrap_or(selectable_backends[0]));
+    }
+    let mut backend_prompt = cliclack::multiselect("Select backends to prepare")
+        .required(true)
+        .initial_values(initially_selected);
+    for backend in selectable_backends {
+        let hint = probes
+            .iter()
+            .find(|probe| probe.view.id == backend.as_str())
+            .map(backend_prompt_hint)
+            .unwrap_or_else(|| "not available in this build".into());
+        backend_prompt = backend_prompt.item(backend, backend.label(), hint);
+    }
+    let selected_backends = match backend_prompt.interact() {
+        Ok(backends) => backends,
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(None),
+        Err(error) => return Err(error).context("choose runtime backends"),
+    };
+
+    let initially_selected = harness_specs
+        .iter()
+        .filter(|specification| specification.detected(home))
+        .map(|specification| specification.id)
+        .collect::<Vec<_>>();
+    let mut harness_prompt = cliclack::multiselect("Configure Agent Sandbox integrations?")
+        .required(false)
+        .initial_values(initially_selected);
+    for specification in harness_specs {
+        let state = inspect_skill(&specification.skill_path(home))?;
+        harness_prompt = harness_prompt.item(
+            specification.id,
+            specification.label,
+            harness_prompt_hint(specification, state, home),
+        );
+    }
+    let selected_harnesses = match harness_prompt.interact() {
+        Ok(harnesses) => harnesses.into_iter().collect(),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(None),
+        Err(error) => return Err(error).context("choose agent integrations"),
+    };
+
+    let desired_backends = selected_backends
+        .into_iter()
+        .map(|backend| backend.as_str().to_owned())
+        .collect::<BTreeSet<_>>();
+    Ok(Some(SetupChoices {
+        target_default: config.runtime.backend.clone(),
+        desired_backends,
+        selected_harnesses,
+    }))
+}
+
+fn selectable_backend_options(probes: &[BackendProbe]) -> Vec<SetupBackendArg> {
+    setup_backend_options()
+        .into_iter()
+        .filter(|backend| {
+            probes
+                .iter()
+                .find(|probe| probe.view.id == backend.as_str())
+                .is_some_and(|probe| probe.host_supported)
+        })
+        .collect()
+}
+
+fn unavailable_backend_options(probes: &[BackendProbe]) -> Vec<SetupBackendArg> {
+    setup_backend_options()
+        .into_iter()
+        .filter(|backend| {
+            probes
+                .iter()
+                .find(|probe| probe.view.id == backend.as_str())
+                .is_some_and(|probe| !probe.host_supported)
+        })
+        .collect()
+}
+
+fn setup_backend_options() -> [SetupBackendArg; 4] {
+    [
+        SetupBackendArg::Microsandbox,
+        SetupBackendArg::Qemu,
+        SetupBackendArg::AndroidEmulator,
+        SetupBackendArg::Cuttlefish,
+    ]
+}
+
+fn setup_backend_from_name(name: &str) -> Option<SetupBackendArg> {
+    setup_backend_options()
+        .into_iter()
+        .find(|backend| backend.as_str() == name)
+}
+
+fn backend_prompt_hint(probe: &BackendProbe) -> String {
+    match probe.view.status.as_str() {
+        "ready" => "ready".into(),
+        "missing" if probe.install_can_fix => "missing · setup can install it".into(),
+        "missing" if probe.view.id == "android-emulator" => {
+            if probe.view.detail.contains("choose from:") {
+                "needs configuration · local AVD found".into()
+            } else {
+                "needs configuration".into()
+            }
+        }
+        "missing" => "missing · manual configuration required".into(),
+        _ => "needs attention".into(),
+    }
+}
+
+fn backend_unavailable_hint(probe: &BackendProbe) -> String {
+    match probe.view.id.as_str() {
+        "cuttlefish" => "unavailable · Linux only".into(),
+        "microsandbox" => format!(
+            "unavailable on {} {}",
+            friendly_os(env::consts::OS),
+            friendly_architecture(env::consts::ARCH)
+        ),
+        "android-emulator" => {
+            format!("unavailable on {}", friendly_os(env::consts::OS))
+        }
+        _ => "unavailable on this host".into(),
+    }
+}
+
+fn harness_prompt_hint(
+    specification: &HarnessSpec,
+    state: SkillState,
+    home: &Path,
+) -> &'static str {
+    match (specification.detected(home), state) {
+        (_, SkillState::Conflict) => "conflict at target path",
+        (true, SkillState::Ready) => "detected · configured",
+        (true, SkillState::ManagedOutdated) => "detected · update available",
+        (true, SkillState::Missing) => "detected",
+        (false, SkillState::Ready) => "configured",
+        (false, SkillState::ManagedOutdated) => "update available",
+        (false, SkillState::Missing) => "not detected",
+    }
+}
+
+fn print_wizard_review(snapshot: &SetupSnapshot) -> Result<()> {
+    let selected_backends = snapshot
+        .backends
+        .iter()
+        .filter(|backend| backend.selected)
+        .map(|backend| {
+            format!(
+                "{} · {}",
+                friendly_backend_name(&backend.id),
+                display_backend_status(backend)
+            )
+        })
+        .collect::<Vec<_>>();
+    let integrations = snapshot
+        .harnesses
+        .iter()
+        .filter(|harness| harness.selected)
+        .map(|harness| harness.label.as_str())
+        .collect::<Vec<_>>();
+
+    let mut review = vec![
+        format!(
+            "Backends         {}",
+            if selected_backends.is_empty() {
+                "none".into()
+            } else {
+                selected_backends.join(", ")
+            }
+        ),
+        format!(
+            "Integrations     {}",
+            if integrations.is_empty() {
+                "none".into()
+            } else {
+                integrations.join(", ")
+            }
+        ),
+        format!("Config           {}", friendly_path(&snapshot.config_path)),
+        String::new(),
+    ];
+    if snapshot.actions.is_empty() {
+        review.push("No changes required.".into());
+    } else {
+        review.push(format!(
+            "{} change{}:",
+            snapshot.actions.len(),
+            if snapshot.actions.len() == 1 { "" } else { "s" }
+        ));
+        for (index, action) in snapshot.actions.iter().enumerate() {
+            review.push(format!(
+                "  {}. {}",
+                index + 1,
+                friendly_action_summary(action)
+            ));
+        }
+    }
+    cliclack::note("Review", review.join("\n")).context("render setup review")?;
+    for blocker in &snapshot.blockers {
+        cliclack::log::error(blocker).context("render setup blocker")?;
+    }
+    Ok(())
+}
+
+fn friendly_action_summary(action: &ActionView) -> String {
+    match action.kind.as_str() {
+        "write-config" => {
+            let backend = action
+                .detail
+                .strip_prefix("set runtime.backend = ")
+                .map(|backend| backend.trim_matches('"'))
+                .map(friendly_backend_name)
+                .unwrap_or("configured backend");
+            format!(
+                "Set runtime backend → {backend}\n     {}",
+                friendly_path(Path::new(&action.target))
+            )
+        }
+        "install-skill" => {
+            let harnesses = action
+                .detail
+                .strip_prefix("configure ")
+                .unwrap_or(&action.detail);
+            format!(
+                "Configure {harnesses}\n     Agent Skill → {}",
+                friendly_path(Path::new(&action.target))
+            )
+        }
+        "install-backend" => {
+            format!(
+                "Prepare {}\n     {}",
+                friendly_backend_name(&action.target),
+                action.detail
+            )
+        }
+        _ => format!("{} {} · {}", action.kind, action.target, action.detail),
+    }
+}
+
+async fn apply_actions_with_progress(
+    actions: &[Action],
+    config: &HostConfig,
+    desired_backends: &BTreeSet<String>,
+) -> Result<()> {
+    if actions.iter().any(Action::is_backend_action) {
+        cliclack::log::step("Preparing runtime backends").context("render setup progress")?;
+        if let Err(error) = apply_backend_actions(actions).await {
+            let _ = cliclack::log::error("Runtime preparation failed");
+            return Err(error);
+        }
+        cliclack::log::success("Runtime preparation complete").context("render setup progress")?;
+    }
+
+    let verification = cliclack::spinner();
+    verification.start("Verifying requested backends");
+    if let Err(error) = verify_requested_backends(config, desired_backends).await {
+        verification.error("Backend verification failed");
+        return Err(error);
+    }
+    verification.stop("Requested backends are ready");
+
+    if actions.iter().any(Action::is_configuration_action) {
+        cliclack::log::step("Writing configuration and Agent Skills")
+            .context("render setup progress")?;
+        if let Err(error) = apply_configuration_actions(actions) {
+            let _ = cliclack::log::error("Configuration update failed");
+            return Err(error);
+        }
+        cliclack::log::success("Configuration and Agent Skills updated")
+            .context("render setup progress")?;
+    }
+    Ok(())
 }
 
 async fn probe_backends(config: &HostConfig) -> Result<Vec<BackendProbe>> {
@@ -397,6 +837,7 @@ async fn probe_backends(config: &HostConfig) -> Result<Vec<BackendProbe>> {
             },
             missing_runtime: microsandbox_missing,
             install_can_fix: microsandbox_install_can_fix(&microsandbox_checks),
+            host_supported: microsandbox_host_supported(),
         },
         BackendProbe {
             view: BackendView {
@@ -407,6 +848,7 @@ async fn probe_backends(config: &HostConfig) -> Result<Vec<BackendProbe>> {
             },
             missing_runtime: qemu_missing,
             install_can_fix: qemu_missing,
+            host_supported: true,
         },
         BackendProbe {
             view: BackendView {
@@ -417,6 +859,7 @@ async fn probe_backends(config: &HostConfig) -> Result<Vec<BackendProbe>> {
             },
             missing_runtime: cuttlefish_missing,
             install_can_fix: false,
+            host_supported: env::consts::OS == "linux",
         },
         BackendProbe {
             view: BackendView {
@@ -427,6 +870,7 @@ async fn probe_backends(config: &HostConfig) -> Result<Vec<BackendProbe>> {
             },
             missing_runtime: android_emulator_missing,
             install_can_fix: false,
+            host_supported: android_emulator_host_supported(),
         },
     ])
 }
@@ -844,9 +1288,24 @@ impl SetupBackendArg {
             Self::AndroidEmulator => "android-emulator",
         }
     }
+
+    fn label(self) -> &'static str {
+        friendly_backend_name(self.as_str())
+    }
 }
 
 impl Action {
+    fn is_backend_action(&self) -> bool {
+        matches!(
+            self,
+            Self::InstallMicrosandbox { .. } | Self::RunInstaller { .. }
+        )
+    }
+
+    fn is_configuration_action(&self) -> bool {
+        matches!(self, Self::WriteConfig { .. } | Self::WriteSkill { .. })
+    }
+
     fn view(&self) -> ActionView {
         match self {
             Self::InstallMicrosandbox { release } => ActionView {
@@ -952,6 +1411,10 @@ fn microsandbox_host_supported() -> bool {
         (env::consts::OS, env::consts::ARCH),
         ("macos", "aarch64") | ("linux", "x86_64") | ("linux", "aarch64")
     )
+}
+
+fn android_emulator_host_supported() -> bool {
+    matches!(env::consts::OS, "macos" | "linux" | "windows")
 }
 
 fn microsandbox_install_can_fix(checks: &[(String, bool, String)]) -> bool {
@@ -1101,49 +1564,159 @@ fn write_atomic(path: &Path, contents: &[u8], unix_mode: Option<u32>) -> Result<
 }
 
 fn print_snapshot(snapshot: &SetupSnapshot) {
-    println!("Agent Sandbox setup");
-    println!("Host: {} {}", snapshot.host.os, snapshot.host.architecture);
-    println!("Config: {}", snapshot.config_path.display());
-    println!("Default backend: {}", snapshot.default_backend);
+    let color = terminal_colors_enabled();
+    println!(
+        "{}",
+        paint("Agent Sandbox setup", &Style::new().bold(), color)
+    );
+    println!(
+        "{} {}  ·  {}",
+        friendly_os(snapshot.host.os),
+        friendly_architecture(snapshot.host.architecture),
+        snapshot.config_path.display()
+    );
 
-    println!("\nBackends");
+    println!("\n{}", paint("Backends", &Style::new().bold(), color));
     for backend in &snapshot.backends {
+        let role = if backend.selected { "selected" } else { "" };
+        let display_status = display_backend_status(backend);
+        let (symbol, style) = status_appearance(display_status);
+        let padded_name = format!("{:<18}", friendly_backend_name(&backend.id));
+        let padded_status = format!("{display_status:<20}");
         println!(
-            "  [{:<15}] {:<12}{} {}",
-            backend.status,
-            backend.id,
-            if backend.selected { " selected;" } else { "" },
-            backend.detail
+            "  {} {} {} {}",
+            paint(symbol, &style, color),
+            padded_name,
+            paint(&padded_status, &style, color),
+            role
         );
+        println!("      {}", backend.detail);
     }
 
-    println!("\nAgent harnesses");
+    println!(
+        "\n{}",
+        paint("Agent integrations", &Style::new().bold(), color)
+    );
     for harness in &snapshot.harnesses {
+        let (symbol, style) = status_appearance(&harness.status);
+        let padded_label = format!("{:<18}", harness.label);
+        let padded_status = format!("{:<20}", friendly_status(&harness.status));
         println!(
-            "  [{:<15}] {:<12}{} {}",
-            harness.status,
-            harness.label,
-            if harness.selected { " selected;" } else { "" },
-            harness.skill_path.display()
+            "  {} {} {} {}",
+            paint(symbol, &style, color),
+            padded_label,
+            paint(&padded_status, &style, color),
+            if harness.selected { "selected" } else { "" }
         );
     }
 
-    println!("\nPlan");
+    println!("\n{}", paint("Plan", &Style::new().bold(), color));
     if snapshot.actions.is_empty() {
-        println!("  no changes");
+        println!("  {}", paint("✓", &Style::new().green(), color));
+        println!("    No changes required");
     } else {
         for (index, action) in snapshot.actions.iter().enumerate() {
-            println!(
-                "  {}. {} {} — {}",
-                index + 1,
-                action.kind,
-                action.target,
-                action.detail
-            );
+            let summary = friendly_action_summary(action);
+            let mut lines = summary.lines();
+            if let Some(first) = lines.next() {
+                println!("  {}. {}", index + 1, first);
+            }
+            for line in lines {
+                println!("     {}", line.trim_start());
+            }
         }
     }
-    for blocker in &snapshot.blockers {
-        println!("  BLOCKED: {blocker}");
+    if !snapshot.blockers.is_empty() {
+        println!("\n{}", paint("Blockers", &Style::new().red().bold(), color));
+        for blocker in &snapshot.blockers {
+            println!("  {} {blocker}", paint("✕", &Style::new().red(), color));
+        }
+    }
+}
+
+fn terminal_colors_enabled() -> bool {
+    io::stdout().is_terminal()
+        && env::var_os("NO_COLOR").is_none()
+        && env::var("TERM").is_ok_and(|term| term != "dumb")
+}
+
+fn paint(text: &str, style: &Style, enabled: bool) -> String {
+    if enabled {
+        style.apply_to(text).to_string()
+    } else {
+        text.to_owned()
+    }
+}
+
+fn status_appearance(status: &str) -> (&'static str, Style) {
+    match status {
+        "ready" | "configured" => ("✓", Style::new().green()),
+        "missing"
+        | "not-configured"
+        | "update-available"
+        | "needs-attention"
+        | "needs configuration" => ("!", Style::new().yellow()),
+        "unavailable" => ("✕", Style::new().red()),
+        "conflict" => ("✕", Style::new().red()),
+        "detected" => ("●", Style::new().cyan()),
+        "not-detected" => ("–", Style::new().dim()),
+        _ => ("·", Style::new()),
+    }
+}
+
+fn display_backend_status(backend: &BackendView) -> &str {
+    match (backend.id.as_str(), backend.status.as_str()) {
+        ("cuttlefish", "missing") if backend.detail.contains("requires Linux") => "unavailable",
+        ("android-emulator", "missing") => "needs configuration",
+        (_, status) => friendly_status(status),
+    }
+}
+
+fn friendly_status(status: &str) -> &str {
+    match status {
+        "not-configured" => "not configured",
+        "update-available" => "update available",
+        "not-detected" => "not detected",
+        "needs-attention" => "needs attention",
+        status => status,
+    }
+}
+
+fn friendly_backend_name(backend: &str) -> &str {
+    match backend {
+        "microsandbox" => "Microsandbox",
+        "qemu" => "QEMU",
+        "cuttlefish" => "Cuttlefish",
+        "android-emulator" => "Android Emulator",
+        backend => backend,
+    }
+}
+
+fn friendly_os(os: &str) -> &str {
+    match os {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        "linux" => "Linux",
+        os => os,
+    }
+}
+
+fn friendly_architecture(architecture: &str) -> &str {
+    match architecture {
+        "aarch64" => "ARM64",
+        "x86_64" => "x86_64",
+        architecture => architecture,
+    }
+}
+
+fn friendly_path(path: &Path) -> String {
+    let Some(home) = dirs::home_dir() else {
+        return path.display().to_string();
+    };
+    match path.strip_prefix(&home) {
+        Ok(relative) if relative.as_os_str().is_empty() => "~".into(),
+        Ok(relative) => format!("~/{}", relative.display()),
+        Err(_) => path.display().to_string(),
     }
 }
 
@@ -1169,6 +1742,85 @@ fn confirm(action_count: usize) -> Result<bool> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn setup_arguments() -> SetupArgs {
+        SetupArgs {
+            check: false,
+            dry_run: false,
+            default_backend: None,
+            install_backends: Vec::new(),
+            harnesses: Vec::new(),
+            no_harness: false,
+            yes: false,
+            force: false,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn wizard_is_only_implicit_when_no_choices_were_supplied() {
+        let mut arguments = setup_arguments();
+        assert!(!has_explicit_choices(&arguments));
+
+        arguments.force = true;
+        assert!(!has_explicit_choices(&arguments));
+
+        arguments.default_backend = Some(SetupBackendArg::Qemu);
+        assert!(has_explicit_choices(&arguments));
+    }
+
+    #[test]
+    fn explicit_choices_preserve_non_interactive_selection() {
+        let directory = tempdir().unwrap();
+        let mut arguments = setup_arguments();
+        arguments.default_backend = Some(SetupBackendArg::Qemu);
+        arguments.install_backends = vec![SetupBackendArg::Microsandbox];
+        arguments.no_harness = true;
+
+        let choices = choices_from_arguments(
+            &arguments,
+            &HostConfig::default(),
+            &harness_specs(),
+            directory.path(),
+        );
+        assert_eq!(choices.target_default, "qemu");
+        assert_eq!(
+            choices.desired_backends,
+            BTreeSet::from(["microsandbox".into(), "qemu".into()])
+        );
+        assert!(choices.selected_harnesses.is_empty());
+    }
+
+    #[test]
+    fn wizard_excludes_backends_unsupported_by_the_host() {
+        let probes = setup_backend_options()
+            .into_iter()
+            .map(|backend| BackendProbe {
+                view: BackendView {
+                    id: backend.as_str().into(),
+                    status: "ready".into(),
+                    selected: false,
+                    detail: String::new(),
+                },
+                missing_runtime: false,
+                install_can_fix: false,
+                host_supported: backend != SetupBackendArg::Cuttlefish,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            selectable_backend_options(&probes),
+            vec![
+                SetupBackendArg::Microsandbox,
+                SetupBackendArg::Qemu,
+                SetupBackendArg::AndroidEmulator,
+            ]
+        );
+        assert_eq!(
+            unavailable_backend_options(&probes),
+            vec![SetupBackendArg::Cuttlefish]
+        );
+    }
 
     #[test]
     fn latest_microsandbox_release_uses_platform_bundle_and_digest() {

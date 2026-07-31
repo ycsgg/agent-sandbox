@@ -603,9 +603,9 @@ asbx
 
 `asbx setup` 是可重复运行的宿主配置入口。它先检测 backend、虚拟化能力和
 Codex、Claude Code、Cursor、Gemini CLI、OpenCode 等 harness，再展示唯一
-变更计划并等待确认。`--check` 只检测，`--yes` 用于调用方已经审核计划的
-非交互执行；缺少 backend 时不静默切换到语义不同的 backend，更不会回退到
-宿主执行项目代码。
+变更计划并等待确认。`--dry-run` 会完成选择和规划但不执行变更，`--check`
+只检测，`--yes` 用于调用方已经审核计划的非交互执行；缺少 backend 时不静默
+切换到语义不同的 backend，更不会回退到宿主执行项目代码。
 
 通用 Agent Skills 安装到 `~/.agents/skills/agent-sandbox`，Claude Code
 安装到 `~/.claude/skills/agent-sandbox`。已有非 asbx 管理的同名 Skill

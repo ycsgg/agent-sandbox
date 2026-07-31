@@ -4,6 +4,7 @@
 
 ```bash
 asbx setup
+asbx setup --dry-run
 asbx setup --check [--json]
 asbx setup --default-backend microsandbox|qemu|cuttlefish|android-emulator
 asbx setup --install-backend microsandbox|qemu|cuttlefish|android-emulator
@@ -11,7 +12,8 @@ asbx setup --harness codex,claude-code,cursor,gemini,opencode
 ```
 
 Plain `setup` detects installed harnesses, displays backend readiness and a
-deterministic change plan, then asks once before applying it. `--check` is
+deterministic change plan, then asks once before applying it. `--dry-run`
+performs selection and planning but never applies the plan. `--check` is
 read-only. Use `--yes` only after reviewing the plan when stdin is
 non-interactive. Existing unmanaged skills require `--force`.
 
@@ -190,6 +192,7 @@ asbx env create NAME --base ubuntu:24.04 \
 asbx env list [--json]
 asbx env inspect NAME [--json]
 asbx env remove NAME
+asbx setup --dry-run
 asbx setup --check [--json]
 asbx doctor [--backend microsandbox|qemu|cuttlefish|android-emulator] [--json]
 asbx backend list [--json]

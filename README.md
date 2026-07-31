@@ -39,10 +39,11 @@ Run setup once after installing or upgrading the CLI:
 asbx setup
 ```
 
-Setup detects installed agent harnesses and backends, displays the changes it
-would make, and asks before modifying the machine. It can install the
-Microsandbox runtime, invoke a supported package manager for QEMU, create the
-host configuration, and install the Agent Skill.
+In an interactive terminal, Setup opens a guided wizard for choosing one or more
+backends and agent integrations. It then reviews the planned changes and asks
+before modifying the machine. It can install the Microsandbox runtime, invoke a
+supported package manager for QEMU, create the host configuration, and install
+the Agent Skill.
 
 For an explicit or non-interactive installation:
 
@@ -52,9 +53,11 @@ asbx setup \
   --harness codex,claude-code \
   --yes
 
+asbx setup --dry-run
 asbx setup --check --json
 ```
 
+`--dry-run` walks through selection and planning without applying anything.
 `--yes` applies the displayed plan without prompting. `--check` is read-only
 and exits non-zero when an action or manual fix is still required.
 

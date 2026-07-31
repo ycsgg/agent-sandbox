@@ -37,9 +37,9 @@ asbx --version
 asbx setup
 ```
 
-Setup 会检测本机已有的 Agent 工具和后端，先展示变更计划，得到确认后才修改
-机器。它可以安装 Microsandbox runtime、调用受支持的包管理器安装 QEMU、创建
-宿主配置，以及安装 Agent Skill。
+在交互式终端中，Setup 会启动引导界面，依次多选需要准备的后端和 Agent 集成，
+然后展示变更计划，得到确认后才修改机器。它可以安装 Microsandbox runtime、
+调用受支持的包管理器安装 QEMU、创建宿主配置，以及安装 Agent Skill。
 
 如需明确指定目标，或进行非交互安装：
 
@@ -49,11 +49,13 @@ asbx setup \
   --harness codex,claude-code \
   --yes
 
+asbx setup --dry-run
 asbx setup --check --json
 ```
 
-`--yes` 表示不再询问并执行已展示的计划。`--check` 只读；如果仍有待执行操作或
-需要人工修复的问题，会以非零状态退出。
+`--dry-run` 会走完选择和规划流程，但不执行任何变更。`--yes` 表示不再询问并
+执行已展示的计划。`--check` 只读；如果仍有待执行操作或需要人工修复的问题，
+会以非零状态退出。
 
 Skill 的安装位置为：
 
